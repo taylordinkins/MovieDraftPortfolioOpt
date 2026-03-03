@@ -863,11 +863,17 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             display_cols = [
                 "ticker", "current_price", "adjusted_expected",
                 "target_bid_int" if integer_mode else "target_bid",
+                "target_market_bid_int" if integer_mode else "target_market_bid",
                 "max_bid_int" if integer_mode else "max_bid",
                 "risk_penalty", "prob_positive_edge", "prob_large_drawdown",
                 "market_value_ratio", "priority_score", "optimizer_selected",
             ]
-            self.dashboard_model.set_dataframe(avail[[c for c in display_cols if c in avail.columns]])
+            display_df = avail[[c for c in display_cols if c in avail.columns]].copy()
+            display_df = display_df.rename(columns={
+                "target_market_bid_int": "target_mkt_bid_int",
+                "target_market_bid": "target_mkt_bid",
+            })
+            self.dashboard_model.set_dataframe(display_df)
             self._autosize_table_columns(self.dashboard_table)
 
             selected = opt.get("selected", pd.DataFrame()).copy()
@@ -1068,6 +1074,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                 "Glossary:",
                 "- adjusted_expected: risk-adjusted expectation from current price and history features",
                 "- target_bid / target_bid_int: recommended bid after risk penalty and budget share",
+                "- target_market_bid / target_market_bid_int: market-pressure scaled target (same risk logic, league-liquidity scale)",
                 "- prob_positive_edge: probability adjusted_expected exceeds bid threshold",
                 "- prob_large_drawdown: probability of large downside outcome from simulations",
                 "- market_value_ratio: adjusted_expected/current_price",

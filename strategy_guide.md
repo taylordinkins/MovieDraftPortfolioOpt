@@ -27,8 +27,10 @@ It is designed for the codebase as implemented now (CLI + GUI), including:
 2. **Bid recommendation** (auction-dollar scale)
    - `gross_share = adjusted_expected / sum(adjusted_expected over available pool)`
    - `fair_budget_bid = gross_share * budget_basis`
+   - `market_fair_bid = gross_share * league_remaining_budget`
    - `risk_penalty = clip(a*vol_30 + b*drawdown_30 + c*release_risk, 0, r_max)`
    - `target_bid = fair_budget_bid * (1 - risk_penalty) * bid_multiplier`
+   - `target_market_bid = market_fair_bid * (1 - risk_penalty) * bid_multiplier`
    - `max_bid` is auction-scale and capped by your personal executable budget.
 
 3. **Portfolio optimization**
@@ -83,6 +85,7 @@ If these are wrong, portfolio recommendations will be wrong.
 - `Price`: current HSX price (market baseline proxy).
 - `AdjExp`: model-adjusted expected value.
 - `TgtBid` / `TgtInt`: recommended bid (continuous or integer-executable).
+- `TgtMkt` / `TgtMktInt`: market-pressure-scaled target bid (same risk logic, league-liquidity scale).
 - `MaxBid` / `MaxInt`: walk-away ceiling.
 - `MinBid` (integer mode): minimum legal next bid (`previous_bid + 1`).
 - `Risk%`: direct bid penalty from vol/drawdown/release.
@@ -92,6 +95,7 @@ If these are wrong, portfolio recommendations will be wrong.
 - `Score`: blended ranking score.
 - `Opt`: selected in optimizer solution.
 - `Quality filter behavior`: filters constrain optimizer selection; rows can still appear in ranking table even if filtered out from `Opt`.
+- `TgtInt` and `TgtMktInt` are per-movie anchors, not a spend plan. Their column sums are not expected to equal your budget.
 
 ---
 
@@ -248,6 +252,7 @@ Interpretation:
 
 - If picks collapse under `market_fair_bid`, your strategy depends on underpaying.
 - Keep final operational plan tied to `target_bid`, use `market_fair_bid` as stress boundary.
+- Use `TgtMkt`/`TgtMktInt` as the competitive-price context anchor; use `TgtBid`/`TgtInt` as your value-first execution anchor.
 
 ## Step 3: Risk calibration pass
 
@@ -316,6 +321,7 @@ Use this robustness workflow:
    - increase candidate count and MC samples during this pass.
 6. Draft execution rule for contested movies:
    - treat `TgtInt` as practical bid zone
+   - use `TgtMktInt` as market-context checkpoint when pressure is high
    - reserve bidding up to `MaxInt` for true must-haves only
    - if current bid moves above `TgtInt` and aggressive-profile win probability drops sharply, pivot to alternates.
 
@@ -377,8 +383,9 @@ For each movie in sequence:
 4. Read active movie row:
    - `MinBid` = legal next step
    - `TgtInt` = preferred execution level
+   - `TgtMktInt` = competitive-market reference level
    - `MaxInt` = hard stop
-   - `MinBid/TgtInt/MaxInt` are fully actionable for the active movie context; other rows are comparative until you switch context.
+   - `MinBid/TgtInt/TgtMktInt/MaxInt` are fully actionable for the active movie context; other rows are comparative until you switch context.
 5. Decision:
    - if movie remains high priority and selected, bid within `[MinBid, MaxInt]`
    - if price exceeds `MaxInt`, stop and move to alternates
@@ -487,7 +494,7 @@ When the draft is starting and time is tight, use this 4-step loop instead of th
 
 2. **Baseline snapshot** (5 min): Run one expected-gross dashboard pass. Note your top 5 target movies and their MaxInt walk-away prices. This is your operating sheet.
 
-3. **Per-movie decision** (during draft): Set current movie + current bid -> run dashboard -> read TgtInt/MaxInt -> bid or pass. If price exceeds MaxInt, immediately check alternates column.
+3. **Per-movie decision** (during draft): Set current movie + current bid -> run dashboard -> read TgtInt/TgtMktInt/MaxInt -> bid or pass. If price exceeds MaxInt, immediately check alternates column.
 
 4. **Post-assignment rerun**: After winning a movie, rerun the dashboard (budget and pool changed). **Reoptimization priority**: always rerun after anchor picks (top 2-3 movies). For low-value late-round picks where the result won't change your remaining strategy, it's acceptable to skip the rerun and rely on your pre-draft tiers.
 

@@ -1408,13 +1408,13 @@ def menu_draft_strategy_dashboard():
 
     if integer_bid_mode:
         header = (
-            f"{'Ticker':<8}  {'Price':>7}  {'AdjExp':>7}  {'TgtInt':>7}  "
+            f"{'Ticker':<8}  {'Price':>7}  {'AdjExp':>7}  {'TgtInt':>7}  {'TgtMktInt':>9}  "
             f"{'MaxInt':>7}  {'MinBid':>7}  {'Risk%':>7}  "
             f"{'P(Edge)':>8}  {'P(DD)':>8}  {'MktVR':>7}  {'Score':>7}  {'Opt':>3}"
         )
     else:
         header = (
-            f"{'Ticker':<8}  {'Price':>7}  {'AdjExp':>7}  {'TgtBid':>7}  "
+            f"{'Ticker':<8}  {'Price':>7}  {'AdjExp':>7}  {'TgtBid':>7}  {'TgtMkt':>7}  "
             f"{'MaxBid':>7}  {'Risk%':>7}  {'P(Edge)':>8}  {'P(DD)':>8}  "
             f"{'MktVR':>7}  {'Score':>7}  {'Opt':>3}"
         )
@@ -1428,6 +1428,7 @@ def menu_draft_strategy_dashboard():
                 f"{_fmt(row.get('current_price'))}  "
                 f"{_fmt(row.get('adjusted_expected'))}  "
                 f"{_fmt(row.get('target_bid_int'))}  "
+                f"{_fmt(row.get('target_market_bid_int'))}  "
                 f"{_fmt(row.get('max_bid_int'))}  "
                 f"{_fmt(row.get('min_legal_bid_int'))}  "
                 f"{_fmt_prob(row.get('risk_penalty'), 7)}  "
@@ -1443,6 +1444,7 @@ def menu_draft_strategy_dashboard():
                 f"{_fmt(row.get('current_price'))}  "
                 f"{_fmt(row.get('adjusted_expected'))}  "
                 f"{_fmt(row.get('target_bid'))}  "
+                f"{_fmt(row.get('target_market_bid'))}  "
                 f"{_fmt(row.get('max_bid'))}  "
                 f"{_fmt_prob(row.get('risk_penalty'), 7)}  "
                 f"{_fmt_prob(row.get('prob_positive_edge'), 8)}  "

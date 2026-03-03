@@ -826,6 +826,8 @@ def add_bid_guidance(
         market_fair_bid = pd.Series(np.nan, index=out.index)
 
     target_bid_raw = (fair_budget_bid * (1.0 - risk_penalty) * bid_mult).clip(lower=0.0)
+    market_target_base = market_fair_bid.where(pd.notna(market_fair_bid), fair_budget_bid)
+    target_market_bid_raw = (market_target_base * (1.0 - risk_penalty) * bid_mult).clip(lower=0.0)
     # Max walk-away bid should be auction-scale, not HSX-gross-scale.
     max_rational_bid = market_fair_bid.where(pd.notna(market_fair_bid), fair_budget_bid).clip(lower=0.0)
     if has_personal_cap:
@@ -842,20 +844,27 @@ def add_bid_guidance(
         exec_cap = int(np.floor(exec_budget)) if has_personal_cap else 0
 
         target_floor = np.floor(pd.to_numeric(target_bid_raw, errors='coerce').fillna(0.0).to_numpy(dtype=float)).astype(int)
+        target_market_floor = np.floor(
+            pd.to_numeric(target_market_bid_raw, errors='coerce').fillna(0.0).to_numpy(dtype=float)
+        ).astype(int)
         max_floor = np.floor(pd.to_numeric(max_bid_raw, errors='coerce').fillna(0.0).to_numpy(dtype=float)).astype(int)
         upper = np.minimum(max_floor, exec_cap)
         can_bid = upper >= min_legal
 
         target_int = np.maximum(target_floor, min_legal)
         target_int = np.where(can_bid, np.minimum(target_int, upper), 0)
+        target_market_int = np.maximum(target_market_floor, min_legal)
+        target_market_int = np.where(can_bid, np.minimum(target_market_int, upper), 0)
         max_int = upper
 
         target_bid = pd.Series(target_int.astype(float), index=out.index)
+        target_market_bid = pd.Series(target_market_int.astype(float), index=out.index)
         max_bid = pd.Series(max_int.astype(float), index=out.index)
         min_legal_series = pd.Series(float(min_legal), index=out.index)
         can_bid_series = pd.Series(can_bid.astype(bool), index=out.index)
     else:
         target_bid = target_bid_raw
+        target_market_bid = target_market_bid_raw
         max_bid = max_bid_raw
         min_legal_series = pd.Series(np.nan, index=out.index)
         can_bid_series = pd.Series(True, index=out.index)
@@ -871,11 +880,14 @@ def add_bid_guidance(
     out['fair_budget_bid'] = fair_budget_bid
     out['market_fair_bid'] = market_fair_bid
     out['target_bid_raw'] = target_bid_raw
+    out['target_market_bid_raw'] = target_market_bid_raw
     out['max_bid_raw'] = max_bid_raw
     out['target_bid'] = target_bid
+    out['target_market_bid'] = target_market_bid
     out['max_rational_bid'] = max_rational_bid
     out['max_bid'] = max_bid
     out['target_bid_int'] = target_bid if integer_bid_mode else np.floor(target_bid_raw)
+    out['target_market_bid_int'] = target_market_bid if integer_bid_mode else np.floor(target_market_bid_raw)
     out['max_bid_int'] = max_bid if integer_bid_mode else np.floor(max_bid_raw)
     out['min_legal_bid_int'] = min_legal_series
     out['can_bid_int'] = can_bid_series
