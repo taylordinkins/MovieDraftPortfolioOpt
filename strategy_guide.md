@@ -89,13 +89,16 @@ If these are wrong, portfolio recommendations will be wrong.
 - `MaxBid` / `MaxInt`: walk-away ceiling.
 - `MinBid` (integer mode): minimum legal next bid (`previous_bid + 1`).
 - `Risk%`: direct bid penalty from vol/drawdown/release.
-- `P(Edge)`: probability value exceeds bid threshold (relative to your chosen bid anchor).
-- `P(DD)`: probability of material downside vs bid.
+- `P(Edge)`: probability value exceeds bid threshold (computed on the active probability basis).
+- `P(DD)`: probability of material downside vs bid (computed on the same active probability basis).
 - `MktVR`: `adjusted_expected / current_price`.
 - `Score`: blended ranking score.
 - `Opt`: selected in optimizer solution.
 - `Quality filter behavior`: filters constrain optimizer selection; rows can still appear in ranking table even if filtered out from `Opt`.
 - `TgtInt` and `TgtMktInt` are per-movie anchors, not a spend plan. Their column sums are not expected to equal your budget.
+- `Probability basis` (shown in CLI/GUI summary) tells you which columns power `P(Edge)` and `P(DD)`:
+  - `target_bid` + `fair_budget_bid` in personal/actionable mode
+  - `target_market_bid` + `market_fair_bid` in market-fair stress mode
 
 ---
 
@@ -247,12 +250,14 @@ Inspect changes in:
 - selected set
 - spend/leftover
 - win probability (if evaluated)
+- probability basis line in summary (`bid=...`, `value=...`)
 
 Interpretation:
 
 - If picks collapse under `market_fair_bid`, your strategy depends on underpaying.
 - Keep final operational plan tied to `target_bid`, use `market_fair_bid` as stress boundary.
 - Use `TgtMkt`/`TgtMktInt` as the competitive-price context anchor; use `TgtBid`/`TgtInt` as your value-first execution anchor.
+- Compare `P(Edge)`/`P(DD)` only when probability basis is the same; switching cost mode now changes probability anchors by design.
 
 ## Step 3: Risk calibration pass
 
@@ -456,7 +461,8 @@ CLI is faster for power users and explicit state updates.
    - `current_price` cost basis is diagnostic and can produce non-actionable selections.
 
 2. **Very high `P(Edge)` across almost all rows**
-   - this often means bids are conservative relative to the value anchor (`target_bid`/`fair_budget_bid` context).
+   - this often means bids are conservative relative to the active probability anchor.
+   - first verify the summary `Probability basis` line before interpreting values.
    - tighten quality thresholds and review value anchor assumptions.
    - run Student-t and copula stress for realism.
 

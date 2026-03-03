@@ -717,6 +717,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             previous_bid = int(self.prev_bid_spin.value())
             budget_mode = self.budget_mode_combo.currentText().strip().lower()
             cost_col = self.cost_combo.currentText().strip()
+            prob_bid_col, prob_value_col = calculations.resolve_probability_anchor_columns(cost_col)
             custom_budget = float(self.custom_budget_spin.value()) if budget_mode == "custom" else None
             if budget_mode == "custom":
                 budget_mode = "personal"
@@ -786,6 +787,8 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                 risk_model=risk_model,
                 integer_bid_mode=integer_mode,
                 previous_bid=previous_bid,
+                prob_bid_col=prob_bid_col,
+                prob_value_col=prob_value_col,
             )
             if dashboard.empty:
                 self._show_error("No strategy rows available.")
@@ -911,6 +914,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                 f"Risk model: {risk_model} | Objective: {objective} | Integer bids: {'on' if integer_mode else 'off'}",
                 f"Seed mode: {run_seed_mode} | Seed used: {run_seed}",
                 f"Cost basis: {cost_col}",
+                f"Probability basis: bid={meta.get('prob_bid_col', 'target_bid')} | value={meta.get('prob_value_col', 'fair_budget_bid')}",
             ]
             if integer_mode:
                 text.append(f"Integer bid rules: whole number, > {previous_bid}, <= remaining budget")

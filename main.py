@@ -1284,6 +1284,7 @@ def menu_draft_strategy_dashboard():
 
     budget_mode, custom_budget = _prompt_budget_inputs(people_df, settings)
     optimizer_cost_col = _prompt_optimizer_cost_col(settings)
+    prob_bid_col, prob_value_col = calculations.resolve_probability_anchor_columns(optimizer_cost_col)
     _prompt_strategy_advanced_controls(settings, optimizer_cost_col)
     run_seed, run_seed_mode = _resolve_runtime_seed_for_run(settings)
     run_settings = dict(settings)
@@ -1300,6 +1301,8 @@ def menu_draft_strategy_dashboard():
         risk_model=risk_model,
         integer_bid_mode=integer_bid_mode,
         previous_bid=previous_bid,
+        prob_bid_col=prob_bid_col,
+        prob_value_col=prob_value_col,
     )
     if dashboard.empty:
         print('No strategy metrics available.')
@@ -1461,6 +1464,10 @@ def menu_draft_strategy_dashboard():
         f"Left: ${opt['leftover']:.2f} | "
         f"AdjExp total: {opt['total_adjusted_expected']:.2f} | "
         f"Cost basis: {opt.get('cost_col', effective_cost_col)}"
+    )
+    print(
+        f"  Probability basis: bid={meta.get('prob_bid_col', 'target_bid')}  "
+        f"value={meta.get('prob_value_col', 'fair_budget_bid')}"
     )
     cap_pct = pd.to_numeric(pd.Series([opt.get('max_budget_pct_per_film', np.nan)]), errors='coerce').iloc[0]
     if pd.notna(cap_pct):

@@ -606,6 +606,7 @@ def add_probability_of_edge(
     out['scenario_horizon_days'] = horizons
     out['scenario_samples'] = scenario_counts
     out['risk_model'] = model
+    out['prob_bid_anchor_col'] = bid_col
     out['prob_value_anchor_col'] = value_col
     out['prob_seed_mode'] = seed_mode
     out['prob_seed_used'] = int(seed)
@@ -953,6 +954,16 @@ def _resolve_per_film_cap_pct(settings: dict, cost_col: str) -> float:
         stress_cap = float(np.clip(settings.get('strategy_market_fair_stresstest_cap', 0.55), 0.01, 1.0))
         return max(base, stress_cap)
     return base
+
+
+def resolve_probability_anchor_columns(cost_col: str) -> tuple[str, str]:
+    """
+    Resolve probability metric anchor columns for a selected optimizer cost basis.
+    """
+    mode = str(cost_col or '').strip().lower()
+    if mode == 'market_fair_bid':
+        return 'target_market_bid', 'market_fair_bid'
+    return 'target_bid', 'fair_budget_bid'
 
 
 def _apply_quality_filters(df: pd.DataFrame, settings: dict) -> tuple[pd.DataFrame, dict]:
@@ -2617,6 +2628,8 @@ def build_strategy_dashboard(
     risk_model: str | None = None,
     integer_bid_mode: bool = False,
     previous_bid: int = 0,
+    prob_bid_col: str | None = None,
+    prob_value_col: str | None = None,
 ) -> tuple[pd.DataFrame, dict, dict]:
     """
     End-to-end Phase 1 pipeline for dashboard + optimizer inputs.
@@ -2629,6 +2642,11 @@ def build_strategy_dashboard(
     tuned_settings['strategy_risk_model'] = resolved_risk_model
     tuned_settings['strategy_integer_bid_mode'] = bool(integer_bid_mode)
     tuned_settings['strategy_integer_prev_bid'] = int(max(previous_bid, 0))
+    default_prob_bid_col, default_prob_value_col = resolve_probability_anchor_columns(
+        tuned_settings.get('strategy_optimizer_cost_col', 'target_bid')
+    )
+    resolved_prob_bid_col = str(prob_bid_col or default_prob_bid_col).strip() or default_prob_bid_col
+    resolved_prob_value_col = str(prob_value_col or default_prob_value_col).strip() or default_prob_value_col
 
     features = build_feature_table(
         hsx_df=hsx_df,
@@ -2655,8 +2673,8 @@ def build_strategy_dashboard(
     )
     probs = add_probability_of_edge(
         bids,
-        bid_col='target_bid',
-        value_col='fair_budget_bid',
+        bid_col=resolved_prob_bid_col,
+        value_col=resolved_prob_value_col,
         settings=tuned_settings,
         history_loader=history_loader,
         risk_model=resolved_risk_model,
@@ -2672,6 +2690,8 @@ def build_strategy_dashboard(
         'diagnostics': strategy_diagnostics(scored),
         'integer_bid_mode': bool(integer_bid_mode),
         'previous_bid': int(max(previous_bid, 0)),
+        'prob_bid_col': resolved_prob_bid_col,
+        'prob_value_col': resolved_prob_value_col,
     }
     if include_validation:
         meta['validation'] = build_phase1_validation_report(
