@@ -461,10 +461,9 @@ CLI is faster for power users and explicit state updates.
    - `current_price` cost basis is diagnostic and can produce non-actionable selections.
 
 2. **Very high `P(Edge)` across almost all rows**
-   - this often means bids are conservative relative to the active probability anchor.
-   - first verify the summary `Probability basis` line before interpreting values.
-   - tighten quality thresholds and review value anchor assumptions.
-   - run Student-t and copula stress for realism.
+   - This usually indicates that your **Target Bids** are significantly lower than the **Fair Value Anchor** (Conservative Bidding).
+   - If your bids are cut by 40-50% for risk, it is statistically unlikely for normal market volatility to push the delisting price below your cost, resulting in 90-100% Edge.
+   - To normalize: Raise your `Bid Multiplier` or use more aggressive presets to see where the competitive "fair fight" zone lies (closer to 50% P(Edge)).
 
 3. **Win probability unstable across runs**
    - increase candidate count and MC samples.
@@ -527,3 +526,14 @@ If you want this guide tuned to your exact league, provide:
 - any roster limits (min/max number of movies)
 
 The current guide assumes no hard roster-size constraint and standard upward auction behavior.
+
+---
+
+## 16) Metric Interpretation FAQ
+
+### Why is P(Edge) always 100% (or very high)?
+This is usually a signal of **Conservative Bidding**. If your `target_bid` is significantly cheaper than the fair-value anchor (due to a low global multiplier or high risk penalties), the stock would have to experience a massive historical "crash" to wipe out your advantage.
+- **Interpretation**: A high P(Edge) means your suggested bid is "safe" relative to historical volatility.
+- **Tuning**: If you want to see a more sensitive "fair value" fight, raise your `strategy_bid_multiplier` to 1.1 or 1.2 to move closer to the fair market price.
+
+---
