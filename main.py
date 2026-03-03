@@ -1117,6 +1117,7 @@ def _prompt_integer_bid_constraints(settings: dict) -> tuple[bool, int]:
 def _prompt_strategy_advanced_controls(settings: dict, optimizer_cost_col: str) -> None:
     """Optional advanced tuning for optimization/scenario controls."""
     print('\nAdvanced tuning controls:')
+    print('  - valuation signal strength (lambda)')
     print('  - bid multiplier')
     print('  - per-film cap % (base + market-fair stress cap)')
     print('  - risk penalty shape + portfolio penalties')
@@ -1156,6 +1157,7 @@ def _prompt_strategy_advanced_controls(settings: dict, optimizer_cost_col: str) 
         except ValueError:
             pass
 
+    _ask_float('strategy_lambda', 'Valuation lambda', 0.0, 2.0)
     _ask_float('strategy_bid_multiplier', 'Bid multiplier', 0.50, 2.00)
     _ask_float('strategy_max_budget_pct_per_film', 'Base per-film cap (0.01-1.00)', 0.01, 1.00)
     _ask_float('strategy_market_fair_stresstest_cap', 'Market-fair stress cap (0.01-1.00)', 0.01, 1.00)
@@ -1479,6 +1481,10 @@ def menu_draft_strategy_dashboard():
             f"and P(DD)<={100.0*float(qf.get('max_prob_large_drawdown', 1.0)):.0f}%  "
             f"(rows kept: {qf.get('rows_after', 0)}/{qf.get('rows_before', 0)})"
         )
+    print(
+        f"  Valuation controls: lambda={float(tuned_settings.get('strategy_lambda', 0.35)):.2f}  "
+        f"clip=[{float(tuned_settings.get('strategy_clip_low', 0.85)):.2f}, {float(tuned_settings.get('strategy_clip_high', 1.15)):.2f}]"
+    )
     print(
         f"  Risk penalty coeffs: A={float(tuned_settings.get('strategy_risk_a_vol', 3.0)):.2f}  "
         f"B={float(tuned_settings.get('strategy_risk_b_drawdown', 1.4)):.2f}  "

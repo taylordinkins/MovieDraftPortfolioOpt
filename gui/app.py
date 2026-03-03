@@ -200,29 +200,36 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.bid_mult_spin.setSingleStep(0.05)
         controls.addWidget(self.bid_mult_spin, 3, 1)
 
-        controls.addWidget(QtWidgets.QLabel("Base Cap"), 3, 2)
+        controls.addWidget(QtWidgets.QLabel("Lambda"), 3, 2)
+        self.lambda_spin = QtWidgets.QDoubleSpinBox()
+        self.lambda_spin.setRange(0.0, 2.0)
+        self.lambda_spin.setDecimals(2)
+        self.lambda_spin.setSingleStep(0.05)
+        controls.addWidget(self.lambda_spin, 3, 3)
+
+        controls.addWidget(QtWidgets.QLabel("Base Cap"), 3, 4)
         self.base_cap_spin = QtWidgets.QDoubleSpinBox()
         self.base_cap_spin.setRange(0.01, 1.00)
         self.base_cap_spin.setDecimals(2)
         self.base_cap_spin.setSingleStep(0.01)
-        controls.addWidget(self.base_cap_spin, 3, 3)
+        controls.addWidget(self.base_cap_spin, 3, 5)
 
-        controls.addWidget(QtWidgets.QLabel("Fair Stress Cap"), 3, 4)
+        controls.addWidget(QtWidgets.QLabel("Fair Stress Cap"), 3, 6)
         self.fair_cap_spin = QtWidgets.QDoubleSpinBox()
         self.fair_cap_spin.setRange(0.01, 1.00)
         self.fair_cap_spin.setDecimals(2)
         self.fair_cap_spin.setSingleStep(0.01)
-        controls.addWidget(self.fair_cap_spin, 3, 5)
+        controls.addWidget(self.fair_cap_spin, 3, 7)
 
         self.quality_filter_check = QtWidgets.QCheckBox("Quality Filter")
-        controls.addWidget(self.quality_filter_check, 3, 6)
+        controls.addWidget(self.quality_filter_check, 3, 8)
 
-        controls.addWidget(QtWidgets.QLabel("Min P(Edge)"), 3, 7)
+        controls.addWidget(QtWidgets.QLabel("Min P(Edge)"), 3, 9)
         self.min_edge_spin = QtWidgets.QDoubleSpinBox()
         self.min_edge_spin.setRange(0.0, 1.0)
         self.min_edge_spin.setDecimals(2)
         self.min_edge_spin.setSingleStep(0.05)
-        controls.addWidget(self.min_edge_spin, 3, 8)
+        controls.addWidget(self.min_edge_spin, 3, 10)
 
         controls.addWidget(QtWidgets.QLabel("Max P(DD)"), 4, 0)
         self.max_dd_spin = QtWidgets.QDoubleSpinBox()
@@ -523,6 +530,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.prev_bid_spin.setValue(state_prev if state_prev > 0 else saved_prev)
 
         self.bid_mult_spin.setValue(float(settings.get("strategy_bid_multiplier", 1.00)))
+        self.lambda_spin.setValue(float(settings.get("strategy_lambda", 0.35)))
         self.base_cap_spin.setValue(float(settings.get("strategy_max_budget_pct_per_film", 0.22)))
         self.fair_cap_spin.setValue(float(settings.get("strategy_market_fair_stresstest_cap", 0.55)))
         self.quality_filter_check.setChecked(bool(settings.get("strategy_enable_quality_filters", True)))
@@ -588,6 +596,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         settings["strategy_budget_mode_preference"] = self.budget_mode_combo.currentText().strip().lower()
         settings["strategy_custom_budget_amount"] = float(self.custom_budget_spin.value())
         settings["strategy_optimizer_cost_col"] = self.cost_combo.currentText().strip()
+        settings["strategy_lambda"] = float(self.lambda_spin.value())
         settings["strategy_bid_multiplier"] = float(self.bid_mult_spin.value())
         settings["strategy_max_budget_pct_per_film"] = float(self.base_cap_spin.value())
         settings["strategy_market_fair_stresstest_cap"] = float(self.fair_cap_spin.value())
@@ -730,6 +739,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             settings["strategy_budget_mode_preference"] = self.budget_mode_combo.currentText().strip().lower()
             settings["strategy_custom_budget_amount"] = float(self.custom_budget_spin.value())
             settings["strategy_optimizer_cost_col"] = cost_col
+            _set_with_override("strategy_lambda", float(self.lambda_spin.value()))
             _set_with_override("strategy_bid_multiplier", float(self.bid_mult_spin.value()))
             _set_with_override("strategy_max_budget_pct_per_film", float(self.base_cap_spin.value()))
             _set_with_override("strategy_market_fair_stresstest_cap", float(self.fair_cap_spin.value()))
@@ -915,6 +925,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                 f"Seed mode: {run_seed_mode} | Seed used: {run_seed}",
                 f"Cost basis: {cost_col}",
                 f"Probability basis: bid={meta.get('prob_bid_col', 'target_bid')} | value={meta.get('prob_value_col', 'fair_budget_bid')}",
+                f"Valuation controls: lambda={float(tuned.get('strategy_lambda', 0.35)):.2f} | clip=[{float(tuned.get('strategy_clip_low', 0.85)):.2f}, {float(tuned.get('strategy_clip_high', 1.15)):.2f}]",
             ]
             if integer_mode:
                 text.append(f"Integer bid rules: whole number, > {previous_bid}, <= remaining budget")
