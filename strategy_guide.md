@@ -175,25 +175,32 @@ If these are wrong, portfolio recommendations will be wrong.
 
 ---
 
-## 6b) Quick-Start Config (Time-Constrained Prep)
+## 6b) Quick-Start Config (Time-Constrained Prep, Market-Fair First)
 
-If you only have 15-30 minutes before a draft, focus on these 10 parameters:
+If you only have 15-30 minutes before a draft and want market-fair analysis first, focus on these parameters:
 
 | Parameter | Recommended Default | Why It Matters |
 |-----------|-------------------|----------------|
 | Preset | `balanced` | Sensible starting point for all weights and penalties |
 | `strategy_lambda` | 0.3-0.5 | Controls how far AdjExp deviates from market price |
-| `strategy_bid_multiplier` | 0.9-1.0 | Global aggression; lower = more conservative bids |
-| `strategy_max_budget_pct_per_film` | 0.25-0.35 | Prevents overconcentration on a single movie |
+| `strategy_bid_multiplier` | 0.95-1.05 | Global aggression; keep near 1.0 for stable market-fair comparisons |
+| `strategy_max_budget_pct_per_film` | 0.20-0.30 | Base cap for execution discipline and concentration control |
+| `strategy_market_fair_stresstest_cap` | 0.55-0.65 | Allows realistic market-pressure testing for contested tentpoles |
 | `strategy_risk_b_drawdown` | 0.9-1.8 | Penalizes high-drawdown movies; start from preset and tune in this band |
 | `strategy_mc_samples` | 1500-3000 | Fast and stable for prep; use 5000-10000 for final stress runs |
 | `strategy_mc_seed_mode` | `fixed` | Reproducible results during prep |
 | `strategy_integer_bid_mode` | `on` | Match your league rules |
-| Budget basis | `personal` | Uses your remaining budget as actionable allocation basis |
-| Optimizer cost basis | `target_bid` | Actionable auction-dollar execution basis |
+| Budget basis | `personal` | Keeps your bid targets anchored to your executable bankroll |
+| Optimizer cost basis | `market_fair_bid` | Market-pressure analysis basis for ranking/selection stress testing |
 | `strategy_corr_simulation_mode` | `independent` | Skip copula unless you have 30+ days of history for most movies |
 
-For everything else, trust the `balanced` preset defaults. You can always refine later if time permits.
+In this mode, the summary `Probability basis` should read:
+- `bid=target_market_bid`
+- `value=market_fair_bid`
+
+For execution during the live draft, still check `TgtInt` (personal anchor) against `TgtMktInt` (market anchor) and `MaxInt` (hard stop).
+
+For everything else, trust the `balanced` preset defaults. You can refine later if time permits.
 
 ---
 
@@ -206,7 +213,7 @@ Set:
 - Preset: `balanced`
 - Seed mode: `fixed`
 - Integer mode: match league rules (usually `on`)
-- Cost basis: start with `target_bid`
+- Cost basis: start with `market_fair_bid`
 - Correlation mode: start `independent`
 - Search mode: start `current_sampled`
 - Opponent profile: `balanced_field`
@@ -482,11 +489,11 @@ CLI is faster for power users and explicit state updates.
 
 Use this as default operating rhythm:
 
-1. Baseline expected-gross run (`balanced`, fixed seed, independent, target_bid).
+1. Baseline expected-gross run (`balanced`, fixed seed, independent, market_fair_bid).
 2. Risk calibration (cap/filters/penalties) until downside metrics are acceptable.
 3. Win-probability pass (`local_search`, balanced opponents).
 4. Stress pass (`aggressive_bidup`, `t_copula`).
-5. Build final tiers and max-bid sheet.
+5. Build final tiers and max-bid sheet (`TgtInt`, `TgtMktInt`, `MaxInt`).
 6. During draft, rerun after every assignment or major price jump.
 
 ---
