@@ -482,6 +482,8 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         lower_layout = QtWidgets.QHBoxLayout(lower)
         left = QtWidgets.QVBoxLayout()
         left.addWidget(QtWidgets.QLabel("Selected Portfolio"))
+        self.selected_portfolio_summary = QtWidgets.QLabel("")
+        left.addWidget(self.selected_portfolio_summary)
         self.selected_table = QtWidgets.QTableView()
         self.selected_model = DataFrameTableModel(pd.DataFrame())
         self.selected_table.setModel(self.selected_model)
@@ -710,6 +712,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
     def refresh_dashboard_output(self):
         self.dashboard_model.set_dataframe(pd.DataFrame())
         self.selected_model.set_dataframe(pd.DataFrame())
+        self.selected_portfolio_summary.setText("")
         self._autosize_table_columns(self.dashboard_table)
         self._autosize_table_columns(self.selected_table)
         self.dashboard_summary.setPlainText(
@@ -945,6 +948,11 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             sel_cols = [c for c in ["ticker", "target_bid", "optimizer_cost", "adjusted_expected", "eff_per_dollar"] if c in selected.columns]
             self.selected_model.set_dataframe(selected[sel_cols] if sel_cols else selected)
             self._autosize_table_columns(self.selected_table)
+            if "adjusted_expected" in selected.columns and not selected.empty:
+                total_adj = pd.to_numeric(selected["adjusted_expected"], errors="coerce").sum()
+                self.selected_portfolio_summary.setText(f"Total AdjExp: {total_adj:.2f}")
+            else:
+                self.selected_portfolio_summary.setText("")
 
             def _pct(value) -> str:
                 v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
