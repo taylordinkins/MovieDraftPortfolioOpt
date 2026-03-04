@@ -1158,6 +1158,8 @@ def _prompt_strategy_advanced_controls(settings: dict, optimizer_cost_col: str) 
             pass
 
     _ask_float('strategy_lambda', 'Valuation lambda', 0.0, 2.0)
+    _ask_float('strategy_clip_low', 'Valuation clip low (0.50-1.50)', 0.50, 1.50)
+    _ask_float('strategy_clip_high', 'Valuation clip high (0.80-2.50)', 0.80, 2.50)
     _ask_float('strategy_bid_multiplier', 'Bid multiplier', 0.50, 2.00)
     _ask_float('strategy_max_budget_pct_per_film', 'Base per-film cap (0.01-1.00)', 0.01, 1.00)
     _ask_float('strategy_market_fair_stresstest_cap', 'Market-fair stress cap (0.01-1.00)', 0.01, 1.00)
@@ -1403,6 +1405,8 @@ def menu_draft_strategy_dashboard():
     print(f"Seed mode: {run_seed_mode}  | Seed used: {run_seed}")
     if integer_bid_mode:
         print(f'Integer bid rules in effect: bid is whole number, > {previous_bid}, <= remaining budget.')
+        if previous_bid > 0:
+            print('  [Note] Integer bid constraints are applied globally. Non-active movie recommendations are for comparative context only.')
         cap_sources = dashboard.get('integer_cap_source')
         if cap_sources is not None:
             unique_sources = pd.Series(cap_sources).dropna().astype(str).unique().tolist()
@@ -1413,15 +1417,15 @@ def menu_draft_strategy_dashboard():
 
     if integer_bid_mode:
         header = (
-            f"{'Ticker':<8}  {'Price':>7}  {'AdjExp':>7}  {'TgtInt':>7}  {'TgtMktInt':>9}  "
+            f"{'Ticker':<8}  {'Price':>7}  {'AdjMult':>7}  {'AdjExp':>7}  {'TgtInt':>7}  {'TgtMktInt':>9}  "
             f"{'MaxInt':>7}  {'MinBid':>7}  {'Risk%':>7}  "
-            f"{'P(Edge)':>8}  {'P(DD)':>8}  {'MktVR':>7}  {'Score':>7}  {'Opt':>3}"
+            f"{'P(Edge)':>8}  {'P(DD)':>8}  {'DealQ':>7}  {'Score':>7}  {'Opt':>3}"
         )
     else:
         header = (
-            f"{'Ticker':<8}  {'Price':>7}  {'AdjExp':>7}  {'TgtBid':>7}  {'TgtMkt':>7}  "
+            f"{'Ticker':<8}  {'Price':>7}  {'AdjMult':>7}  {'AdjExp':>7}  {'TgtBid':>7}  {'TgtMkt':>7}  "
             f"{'MaxBid':>7}  {'Risk%':>7}  {'P(Edge)':>8}  {'P(DD)':>8}  "
-            f"{'MktVR':>7}  {'Score':>7}  {'Opt':>3}"
+            f"{'DealQ':>7}  {'Score':>7}  {'Opt':>3}"
         )
     print(header)
     print('─' * len(header))
@@ -1431,15 +1435,16 @@ def menu_draft_strategy_dashboard():
             print(
                 f"{row['ticker']:<8}  "
                 f"{_fmt(row.get('current_price'))}  "
+                f"{_fmt(row.get('adjustment_multiplier'))}  "
                 f"{_fmt(row.get('adjusted_expected'))}  "
-                f"{_fmt(row.get('target_bid_int'))}  "
-                f"{_fmt(row.get('target_market_bid_int'))}  "
-                f"{_fmt(row.get('max_bid_int'))}  "
-                f"{_fmt(row.get('min_legal_bid_int'))}  "
+                f"{row.get('target_bid_int', ''):>7}  "
+                f"{row.get('target_market_bid_int', ''):>9}  "
+                f"{row.get('max_bid_int', ''):>7}  "
+                f"{row.get('min_legal_bid_int', ''):>7}  "
                 f"{_fmt_prob(row.get('risk_penalty'), 7)}  "
                 f"{_fmt_prob(row.get('prob_positive_edge'), 8)}  "
                 f"{_fmt_prob(row.get('prob_large_drawdown'), 8)}  "
-                f"{_fmt(row.get('market_value_ratio'))}  "
+                f"{_fmt(row.get('deal_quality'))}  "
                 f"{_fmt(row.get('priority_score'))}  "
                 f"{'*' if row.get('optimizer_selected') else '':>3}"
             )
@@ -1447,6 +1452,7 @@ def menu_draft_strategy_dashboard():
             print(
                 f"{row['ticker']:<8}  "
                 f"{_fmt(row.get('current_price'))}  "
+                f"{_fmt(row.get('adjustment_multiplier'))}  "
                 f"{_fmt(row.get('adjusted_expected'))}  "
                 f"{_fmt(row.get('target_bid'))}  "
                 f"{_fmt(row.get('target_market_bid'))}  "
@@ -1454,7 +1460,7 @@ def menu_draft_strategy_dashboard():
                 f"{_fmt_prob(row.get('risk_penalty'), 7)}  "
                 f"{_fmt_prob(row.get('prob_positive_edge'), 8)}  "
                 f"{_fmt_prob(row.get('prob_large_drawdown'), 8)}  "
-                f"{_fmt(row.get('market_value_ratio'))}  "
+                f"{_fmt(row.get('deal_quality'))}  "
                 f"{_fmt(row.get('priority_score'))}  "
                 f"{'*' if row.get('optimizer_selected') else '':>3}"
             )

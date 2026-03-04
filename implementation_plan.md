@@ -95,7 +95,7 @@ If league budget is available, keep personal budget as the main basis and add:
 Bid formulas:
 
 - `target_bid = fair_budget_bid * (1 - risk_penalty) * preset_bid_multiplier`
-- `max_rational_bid = adjusted_expected`
+- `max_rational_bid = market_fair_bid` (auction-dollar ceiling based on league proportional allocation)
 - `value_ratio = adjusted_expected / target_bid`
 
 Recommended outputs:

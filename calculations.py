@@ -2289,31 +2289,51 @@ def estimate_portfolio_win_probability(
 
 def add_priority_score(strategy_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add a ranking score that blends edge confidence with value efficiency.
+    Add a ranking score that blends edge confidence with value efficiency,
+    and a deal_quality metric that measures confidence-weighted fair value
+    per dollar of market-competitive bid.
     """
     out = strategy_df.copy()
     if out.empty:
         return out
     adj = pd.to_numeric(out.get('adjusted_expected', np.nan), errors='coerce').fillna(0.0).clip(lower=0.0)
-    vratio = pd.to_numeric(out.get('market_value_ratio', out.get('value_ratio', np.nan)), errors='coerce').fillna(0.0).clip(lower=0.0)
     p_edge = pd.to_numeric(out.get('prob_positive_edge', np.nan), errors='coerce').fillna(0.0).clip(0.0, 1.0)
     p_dd = pd.to_numeric(out.get('prob_large_drawdown', np.nan), errors='coerce').fillna(0.0).clip(0.0, 1.0)
     risk = pd.to_numeric(out.get('risk_penalty', np.nan), errors='coerce').fillna(0.0).clip(0.0, 1.0)
 
-    # Normalize components to avoid algebraic cancellation between value_ratio and risk scaling.
     z_adj = _zscore(np.log1p(adj))
-    z_vratio = _zscore(np.log1p(vratio))
     z_edge = _zscore(p_edge)
     z_dd = _zscore(p_dd)
     z_risk = _zscore(risk)
 
     out['priority_score'] = (
-        0.45 * z_adj
-        + 0.20 * z_vratio
-        + 0.20 * z_edge
+        0.50 * z_adj
+        + 0.25 * z_edge
         - 0.10 * z_dd
         - 0.15 * z_risk
     )
+
+    # Deal Quality: confidence-weighted fair value per market-competitive dollar.
+    # Uses market_fair_bid (fair auction-$ value) / target_market_bid (risk-
+    # adjusted market cost), weighted by empirical P(Edge) and (1-P(DD)).
+    # In integer mode, uses the integerized market bid for genuine per-movie
+    # variation from rounding/clipping.
+    # DealQ > 1 = underpriced (confidence exceeds cost); < 1 = overpriced.
+    integer_mode = bool(out.get('integer_bid_mode', pd.Series(False)).iloc[0]) if not out.empty else False
+    if integer_mode and 'target_market_bid_int' in out.columns:
+        mkt_cost = pd.to_numeric(out['target_market_bid_int'], errors='coerce')
+    else:
+        mkt_cost = pd.to_numeric(out.get('target_market_bid', np.nan), errors='coerce')
+    mkt_fair = pd.to_numeric(out.get('market_fair_bid', np.nan), errors='coerce')
+    p_edge_raw = pd.to_numeric(out.get('prob_positive_edge', np.nan), errors='coerce')
+
+    confidence = p_edge * (1.0 - p_dd)
+    fair_ratio = np.where(mkt_cost > 0, mkt_fair / mkt_cost, np.nan)
+    raw_deal_q = pd.Series(fair_ratio, index=out.index) * confidence
+    # Preserve NaN when probability data or market bid is missing.
+    raw_deal_q = raw_deal_q.where(p_edge_raw.notna() & (mkt_cost > 0) & mkt_fair.notna(), np.nan)
+    out['deal_quality'] = raw_deal_q
+
     return out
 
 
@@ -2402,29 +2422,29 @@ def strategy_ranking_stability(
     }
 
 
-def _signal_from_history_window(prices: pd.Series, settings: dict) -> float:
-    """
-    Lightweight historical signal proxy used for forward-direction sanity checks.
-    """
+def _extract_features_at_time(prices: pd.Series) -> dict[str, float]:
+    """Extract raw features from a price series ending at a given time step."""
     if len(prices) < 31:
-        return np.nan
-
-    r7 = _window_return(prices, 7)
-    r14 = _window_return(prices, 14)
-    r30 = _window_return(prices, 30)
-    tr30 = _log_slope(prices.tail(30))
-    last_31 = prices.tail(31)
-    vol30 = float(last_31.pct_change().dropna().std(ddof=0))
-    dd30 = _max_drawdown(prices.tail(30))
-
-    feats = {
-        'mom_7': r7,
-        'mom_14': r14,
-        'mom_30': r30,
-        'trend_30': tr30,
-        'vol_30': vol30,
-        'drawdown_30': dd30,
+        return {}
+    return {
+        'mom_7': _window_return(prices, 7),
+        'mom_14': _window_return(prices, 14),
+        'mom_30': _window_return(prices, 30),
+        'trend_30': _log_slope(prices.tail(30)),
+        'vol_30': float(prices.tail(31).pct_change().dropna().std(ddof=0)),
+        'drawdown_30': _max_drawdown(prices.tail(30)),
     }
+
+
+def _cross_sectional_zscore_signal(
+    feature_rows: dict[str, dict[str, float]],
+    settings: dict,
+) -> dict[str, float]:
+    """
+    Compute z-scored weighted signal for each ticker across a cross-section,
+    matching the dashboard's add_adjusted_expected logic.
+    """
+    feature_names = ['mom_7', 'mom_14', 'mom_30', 'trend_30', 'vol_30', 'drawdown_30']
     weights = {
         'mom_7': float(settings.get('strategy_w_mom_7', 0.20)),
         'mom_14': float(settings.get('strategy_w_mom_14', 0.20)),
@@ -2434,12 +2454,21 @@ def _signal_from_history_window(prices: pd.Series, settings: dict) -> float:
         'drawdown_30': float(settings.get('strategy_w_drawdown_30', -0.20)),
     }
 
-    signal = 0.0
-    for k, w in weights.items():
-        v = feats.get(k, np.nan)
-        if pd.notna(v):
-            signal += w * float(v)
-    return float(signal)
+    tickers = list(feature_rows.keys())
+    if len(tickers) < 2:
+        return {t: 0.0 for t in tickers}
+
+    # Build a DataFrame of raw features across the cross-section.
+    raw = pd.DataFrame.from_dict(feature_rows, orient='index')
+    signal = pd.Series(0.0, index=raw.index)
+    for feat in feature_names:
+        if feat not in raw.columns:
+            continue
+        col = pd.to_numeric(raw[feat], errors='coerce')
+        z = _zscore(col)
+        signal += weights.get(feat, 0.0) * z
+
+    return {t: float(signal.get(t, 0.0)) for t in tickers}
 
 
 def strategy_forward_check(
@@ -2448,42 +2477,74 @@ def strategy_forward_check(
     history_loader: Callable[[str], pd.DataFrame | None] | None = None,
 ) -> dict:
     """
-    Simple forward check: historical signal direction vs next-window return direction.
+    Forward check: cross-sectionally z-scored signal direction vs next-window
+    return direction.  Matches the dashboard's add_adjusted_expected z-score
+    methodology so the validation reflects the model actually in use.
     """
     if history_loader is None:
         import storage
         history_loader = storage.load_price_history
 
     horizon = max(int(settings.get('strategy_min_horizon_days', 7)), 1)
-    tickers = movies_df['ticker'].dropna().astype(str).str.upper().unique() if not movies_df.empty else []
+    tickers = movies_df['ticker'].dropna().astype(str).str.upper().unique().tolist() if not movies_df.empty else []
 
-    signals = []
-    forwards = []
-    ticker_count = 0
-
+    # Pre-load all price histories.
+    histories: dict[str, pd.Series] = {}
     for ticker in tickers:
         history_df = _clean_history_df(history_loader(ticker))
         if history_df.empty or len(history_df) < (31 + horizon + 1):
             continue
-        ticker_count += 1
-        prices = history_df['price'].reset_index(drop=True)
-        n = len(prices)
-        for t in range(30, n - horizon):
+        histories[ticker] = history_df['price'].reset_index(drop=True)
+
+    if not histories:
+        return {
+            'samples': 0,
+            'tickers_used': 0,
+            'horizon_days': int(horizon),
+            'directional_accuracy': np.nan,
+            'information_coefficient': np.nan,
+        }
+
+    # Find the common time-step range across all tickers.
+    min_len = min(len(p) for p in histories.values())
+    signals = []
+    forwards = []
+
+    for t in range(30, min_len - horizon):
+        # Compute raw features for every ticker at this time step.
+        feature_rows: dict[str, dict[str, float]] = {}
+        for ticker, prices in histories.items():
+            if t + 1 > len(prices):
+                continue
             window = prices.iloc[:t + 1]
-            signal = _signal_from_history_window(window, settings)
+            feats = _extract_features_at_time(window)
+            if feats:
+                feature_rows[ticker] = feats
+
+        if len(feature_rows) < 2:
+            continue
+
+        # Z-score across the cross-section and compute weighted signal.
+        ticker_signals = _cross_sectional_zscore_signal(feature_rows, settings)
+
+        # Record (signal, forward_return) pairs for each ticker at this step.
+        for ticker, sig in ticker_signals.items():
+            prices = histories[ticker]
+            if t + horizon >= len(prices):
+                continue
             p0 = float(prices.iloc[t])
             p1 = float(prices.iloc[t + horizon])
             if p0 <= 0:
                 continue
             fwd = p1 / p0 - 1.0
-            if pd.notna(signal) and pd.notna(fwd):
-                signals.append(float(signal))
+            if pd.notna(sig) and pd.notna(fwd):
+                signals.append(float(sig))
                 forwards.append(float(fwd))
 
     if not signals:
         return {
             'samples': 0,
-            'tickers_used': int(ticker_count),
+            'tickers_used': int(len(histories)),
             'horizon_days': int(horizon),
             'directional_accuracy': np.nan,
             'information_coefficient': np.nan,
@@ -2505,7 +2566,7 @@ def strategy_forward_check(
 
     return {
         'samples': int(len(s)),
-        'tickers_used': int(ticker_count),
+        'tickers_used': int(len(histories)),
         'horizon_days': int(horizon),
         'directional_accuracy': directional_accuracy,
         'information_coefficient': ic,

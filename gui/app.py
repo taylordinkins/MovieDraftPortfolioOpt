@@ -375,6 +375,20 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.corr_t_df_spin.setRange(3, 60)
         controls.addWidget(self.corr_t_df_spin, 8, 9)
 
+        controls.addWidget(QtWidgets.QLabel("Clip Low"), 7, 6)
+        self.clip_low_spin = QtWidgets.QDoubleSpinBox()
+        self.clip_low_spin.setRange(0.5, 1.5)
+        self.clip_low_spin.setDecimals(2)
+        self.clip_low_spin.setSingleStep(0.05)
+        controls.addWidget(self.clip_low_spin, 7, 7)
+
+        controls.addWidget(QtWidgets.QLabel("Clip High"), 7, 8)
+        self.clip_high_spin = QtWidgets.QDoubleSpinBox()
+        self.clip_high_spin.setRange(0.8, 2.5)
+        self.clip_high_spin.setDecimals(2)
+        self.clip_high_spin.setSingleStep(0.05)
+        controls.addWidget(self.clip_high_spin, 7, 9)
+
         controls.addWidget(QtWidgets.QLabel("Search Mode"), 9, 0)
         self.search_mode_combo = QtWidgets.QComboBox()
         self.search_mode_combo.addItems(["current_sampled", "random_multistart", "local_search", "genetic"])
@@ -537,6 +551,8 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.min_edge_spin.setValue(float(settings.get("strategy_min_prob_positive_edge", 0.20)))
         self.max_dd_spin.setValue(float(settings.get("strategy_max_prob_large_drawdown", 0.20)))
         self.dd_threshold_spin.setValue(float(settings.get("strategy_drawdown_threshold", 0.15)))
+        self.clip_low_spin.setValue(float(settings.get("strategy_clip_low", 0.85)))
+        self.clip_high_spin.setValue(float(settings.get("strategy_clip_high", 1.15)))
         self.mc_samples_spin.setValue(int(settings.get("strategy_mc_samples", 1500)))
         self.mc_opp_spin.setValue(int(settings.get("strategy_mc_num_opponents", 7)))
         self.mc_candidates_spin.setValue(int(settings.get("strategy_mc_candidate_portfolios", 120)))
@@ -597,6 +613,8 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         settings["strategy_custom_budget_amount"] = float(self.custom_budget_spin.value())
         settings["strategy_optimizer_cost_col"] = self.cost_combo.currentText().strip()
         settings["strategy_lambda"] = float(self.lambda_spin.value())
+        settings["strategy_clip_low"] = float(self.clip_low_spin.value())
+        settings["strategy_clip_high"] = float(self.clip_high_spin.value())
         settings["strategy_bid_multiplier"] = float(self.bid_mult_spin.value())
         settings["strategy_max_budget_pct_per_film"] = float(self.base_cap_spin.value())
         settings["strategy_market_fair_stresstest_cap"] = float(self.fair_cap_spin.value())
@@ -874,12 +892,12 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             )
 
             display_cols = [
-                "ticker", "current_price", "adjusted_expected",
+                "ticker", "current_price", "adjustment_multiplier", "adjusted_expected",
                 "target_bid_int" if integer_mode else "target_bid",
                 "target_market_bid_int" if integer_mode else "target_market_bid",
                 "max_bid_int" if integer_mode else "max_bid",
                 "risk_penalty", "prob_positive_edge", "prob_large_drawdown",
-                "market_value_ratio", "priority_score", "optimizer_selected",
+                "deal_quality", "priority_score", "optimizer_selected",
             ]
             display_df = avail[[c for c in display_cols if c in avail.columns]].copy()
             display_df = display_df.rename(columns={
@@ -929,6 +947,8 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             ]
             if integer_mode:
                 text.append(f"Integer bid rules: whole number, > {previous_bid}, <= remaining budget")
+                if previous_bid > 0:
+                    text.append("  [Note] Integer bid constraints are applied globally. Non-active movie recommendations are for comparative context only.")
             mpf = pd.to_numeric(pd.Series([budget_info.get("market_pressure_factor", np.nan)]), errors="coerce").iloc[0]
             if pd.notna(mpf):
                 text.append(f"Market pressure factor (league/personal): {float(mpf):.2f}")
