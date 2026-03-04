@@ -2,7 +2,98 @@
   "version": 1,
   "current_movie": "",
   "current_bid": 0,
-  "updated_at": "2026-03-03T23:45:06.217323+00:00",
+  "updated_at": "2026-03-04T02:01:42.963338+00:00",
   "assignments": {},
-  "history": []
+  "history": [
+    {
+      "event_type": "assign",
+      "ticker": "MARI2",
+      "winner": "Taylor",
+      "final_price": 90.0,
+      "timestamp": "2026-03-04T01:58:25.435039+00:00",
+      "source": "gui_assign",
+      "budget_applied": true
+    },
+    {
+      "event_type": "assign",
+      "ticker": "PRAD2",
+      "winner": "Taylor",
+      "final_price": 40.0,
+      "timestamp": "2026-03-04T01:58:50.383688+00:00",
+      "source": "gui_assign",
+      "budget_applied": true
+    },
+    {
+      "event_type": "assign",
+      "ticker": "SKIES",
+      "winner": "Taylor",
+      "final_price": 35.0,
+      "timestamp": "2026-03-04T01:59:10.999920+00:00",
+      "source": "gui_assign",
+      "budget_applied": true
+    },
+    {
+      "event_type": "assign",
+      "ticker": "PAWP3",
+      "winner": "Taylor",
+      "final_price": 20.0,
+      "timestamp": "2026-03-04T01:59:41.628662+00:00",
+      "source": "gui_assign",
+      "budget_applied": true
+    },
+    {
+      "event_type": "assign",
+      "ticker": "PRJHM",
+      "winner": "Taylor",
+      "final_price": 15.0,
+      "timestamp": "2026-03-04T02:00:14.743347+00:00",
+      "source": "gui_assign",
+      "budget_applied": true
+    },
+    {
+      "event_type": "unassign",
+      "ticker": "PRJHM",
+      "winner": "Taylor",
+      "final_price": 15.0,
+      "timestamp": "2026-03-04T02:01:39.125353+00:00",
+      "source": "gui_clear_all",
+      "budget_restored": true
+    },
+    {
+      "event_type": "unassign",
+      "ticker": "PAWP3",
+      "winner": "Taylor",
+      "final_price": 20.0,
+      "timestamp": "2026-03-04T02:01:39.141932+00:00",
+      "source": "gui_clear_all",
+      "budget_restored": true
+    },
+    {
+      "event_type": "unassign",
+      "ticker": "SKIES",
+      "winner": "Taylor",
+      "final_price": 35.0,
+      "timestamp": "2026-03-04T02:01:39.157504+00:00",
+      "source": "gui_clear_all",
+      "budget_restored": true
+    },
+    {
+      "event_type": "unassign",
+      "ticker": "PRAD2",
+      "winner": "Taylor",
+      "final_price": 40.0,
+      "timestamp": "2026-03-04T02:01:39.172667+00:00",
+      "source": "gui_clear_all",
+      "budget_restored": true
+    },
+    {
+      "event_type": "unassign",
+      "ticker": "MARI2",
+      "winner": "Taylor",
+      "final_price": 90.0,
+      "timestamp": "2026-03-04T02:01:39.187651+00:00",
+      "source": "gui_clear_all",
+      "budget_restored": true
+    }
+  ]
 }

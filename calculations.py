@@ -966,6 +966,72 @@ def resolve_probability_anchor_columns(cost_col: str) -> tuple[str, str]:
     return 'target_bid', 'fair_budget_bid'
 
 
+def resolve_portfolio_eval_mode(mode: str | None) -> str:
+    """Resolve runtime portfolio evaluation mode."""
+    m = str(mode or '').strip().lower()
+    if m in ('fixed_active_paid', 'fixed_paid', 'fixed'):
+        return 'fixed_active_paid'
+    return 'optimizer_selected'
+
+
+def build_fixed_paid_portfolio(
+    strategy_df: pd.DataFrame,
+    assigned_df: pd.DataFrame,
+    active_user: str,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Build a fixed portfolio for a user from assigned movies with recorded paid prices.
+    Returns (portfolio_df, meta).
+    """
+    user = str(active_user or '').strip()
+    out_meta = {
+        'mode': 'fixed_active_paid',
+        'active_user': user,
+        'rows_total_assigned': 0,
+        'rows_user_assigned': 0,
+        'rows_with_paid_price': 0,
+        'rows_with_metrics': 0,
+        'rows_missing_metrics': 0,
+    }
+    if not user or assigned_df.empty:
+        return pd.DataFrame(), out_meta
+
+    assigns = assigned_df.copy()
+    if 'ticker' not in assigns.columns:
+        return pd.DataFrame(), out_meta
+    assigns['ticker'] = assigns['ticker'].astype(str).str.upper()
+    assigns['winner'] = assigns.get('winner', pd.Series('', index=assigns.index)).astype(str).str.strip()
+    assigns['final_price'] = pd.to_numeric(assigns.get('final_price', np.nan), errors='coerce')
+    out_meta['rows_total_assigned'] = int(len(assigns))
+
+    mine = assigns[assigns['winner'] == user].copy()
+    out_meta['rows_user_assigned'] = int(len(mine))
+    if mine.empty:
+        return pd.DataFrame(), out_meta
+
+    mine = mine[mine['final_price'].notna() & (mine['final_price'] > 0)].copy()
+    out_meta['rows_with_paid_price'] = int(len(mine))
+    if mine.empty:
+        return pd.DataFrame(), out_meta
+
+    metrics = strategy_df.copy()
+    metrics['ticker'] = metrics['ticker'].astype(str).str.upper()
+    keep_cols = [c for c in (
+        'ticker', 'adjusted_expected', 'target_bid', 'target_bid_int', 'target_market_bid',
+        'target_market_bid_int', 'max_bid', 'max_bid_int', 'prob_positive_edge',
+        'prob_large_drawdown', 'priority_score'
+    ) if c in metrics.columns]
+    merged = mine.merge(metrics[keep_cols], on='ticker', how='left')
+    merged = merged.rename(columns={'final_price': 'paid_price'})
+    merged['optimizer_cost'] = pd.to_numeric(merged['paid_price'], errors='coerce')
+    adj = pd.to_numeric(merged.get('adjusted_expected', np.nan), errors='coerce')
+    cst = pd.to_numeric(merged.get('optimizer_cost', np.nan), errors='coerce')
+    merged['eff_per_dollar'] = np.where(cst > 0, adj / cst, np.nan)
+    out_meta['rows_with_metrics'] = int(pd.to_numeric(merged.get('adjusted_expected', np.nan), errors='coerce').notna().sum())
+    out_meta['rows_missing_metrics'] = int(len(merged) - out_meta['rows_with_metrics'])
+    return merged, out_meta
+
+
 def _apply_quality_filters(df: pd.DataFrame, settings: dict) -> tuple[pd.DataFrame, dict]:
     info = {
         'enabled': bool(settings.get('strategy_enable_quality_filters', True)),
@@ -1337,7 +1403,9 @@ def simulate_portfolio_monte_carlo(
     mc_samples = max(int(settings.get('strategy_mc_samples', 1500)), 100)
     threshold = float(np.clip(settings.get('strategy_mc_concentration_threshold', 0.40), 0.0, 1.0))
 
-    strategy_map = strategy_df.set_index('ticker')
+    strategy_map = strategy_df.copy()
+    strategy_map['ticker'] = strategy_map['ticker'].astype(str).str.upper()
+    strategy_map = strategy_map.set_index('ticker')
     tickers = portfolio_df['ticker'].astype(str).str.upper().tolist()
     contrib_rows = []
     total = np.zeros(mc_samples, dtype=float)
@@ -2023,6 +2091,7 @@ def estimate_portfolio_win_probability(
     history_loader: Callable[[str], pd.DataFrame | None] | None = None,
     risk_model: str = 'bootstrap',
     cost_col: str = 'current_price',
+    portfolio_cost_col: str = 'optimizer_cost',
 ) -> dict:
     """
     Estimate win probability for a *given* portfolio against simulated opponents.
@@ -2111,6 +2180,8 @@ def estimate_portfolio_win_probability(
 
     valid_tickers = set(cost_df['ticker'].astype(str).str.upper().tolist())
     cost_map = dict(zip(cost_df['ticker'].tolist(), pd.to_numeric(cost_df['optimizer_cost'], errors='coerce').fillna(0.0).tolist()))
+    strategy_map = strategy_df.set_index('ticker')
+    strategy_tickers = set(strategy_map.index.astype(str).str.upper().tolist())
 
     def _is_budget_feasible(ticks: list[str]) -> bool:
         if not ticks:
@@ -2127,8 +2198,8 @@ def estimate_portfolio_win_probability(
         portfolio_df.get('ticker', pd.Series(dtype=object))
         .astype(str).str.upper().tolist()
     )
-    selected_ticks = sorted(set([t for t in selected_ticks if t in valid_tickers]))
-    if not _is_budget_feasible(selected_ticks):
+    selected_ticks = sorted(set([t for t in selected_ticks if t in strategy_tickers]))
+    if not selected_ticks:
         return {
             'win_probability': np.nan,
             'opponent_count': 0,
@@ -2136,10 +2207,20 @@ def estimate_portfolio_win_probability(
             'seed_mode': seed_mode,
             'seed_used': int(seed),
             'search_mode_used': search_mode,
-            'candidate_count_evaluated': int(len(candidate_sets)),
+            'candidate_count_evaluated': 0,
             'search_runtime_ms': float(max((time.perf_counter() - search_t0) * 1000.0, 0.0)),
             'opponent_profile_used': opp_params.get('opponent_profile_used', 'balanced_field'),
+            'portfolio_budget_feasible': np.nan,
+            'selected_portfolio_spend': np.nan,
         }
+
+    sel_spend = np.nan
+    candidate_cost_cols = [portfolio_cost_col, cost_col, 'optimizer_cost', 'paid_price', 'final_price', 'target_bid']
+    for c_name in candidate_cost_cols:
+        if c_name in portfolio_df.columns:
+            sel_spend = float(pd.to_numeric(portfolio_df[c_name], errors='coerce').fillna(0.0).sum())
+            break
+    portfolio_budget_feasible = True if pd.isna(sel_spend) else (float(sel_spend) <= float(budget) + 1e-9)
 
     rng = np.random.default_rng(seed)
     candidate_sets: dict[tuple[str, ...], list[str]] = {}
@@ -2214,8 +2295,6 @@ def estimate_portfolio_win_probability(
             if key and _is_budget_feasible(list(key)):
                 candidate_sets[key] = list(key)
 
-    strategy_map = strategy_df.set_index('ticker')
-
     def _static_expected(ticks: list[str]) -> float:
         total = 0.0
         for t in ticks:
@@ -2284,6 +2363,8 @@ def estimate_portfolio_win_probability(
         'candidate_count_evaluated': int(len(candidate_sets)),
         'search_runtime_ms': float(max((time.perf_counter() - search_t0) * 1000.0, 0.0)),
         'opponent_profile_used': opp_params.get('opponent_profile_used', 'balanced_field'),
+        'portfolio_budget_feasible': bool(portfolio_budget_feasible) if pd.notna(portfolio_budget_feasible) else np.nan,
+        'selected_portfolio_spend': float(sel_spend) if pd.notna(sel_spend) else np.nan,
     }
 
 

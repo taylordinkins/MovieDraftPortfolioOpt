@@ -802,6 +802,7 @@ def menu_draft_state():
             '3': 'Clear current movie context',
             '4': 'List assigned movies',
             '5': 'View assignment history',
+            '6': 'Clear all assignments (restore budgets)',
             '0': 'Back',
         })
         if choice == '0':
@@ -900,6 +901,30 @@ def menu_draft_state():
                     f"{p_txt:<8}  "
                     f"{row.get('source', '')}"
                 )
+            _pause()
+            continue
+
+        if choice == '6':
+            assigned = storage.get_assigned_movies_df()
+            if assigned.empty:
+                print('No assignments to clear.')
+                _pause()
+                continue
+            print('\nWARNING: This will unassign all movies and restore applied budgets when possible.')
+            confirm = _prompt('Type CLEAR to confirm: ').strip()
+            if confirm != 'CLEAR':
+                print('Canceled.')
+                _pause()
+                continue
+            ok, msg, meta = storage.clear_all_assignments(
+                source='cli_clear_all',
+                restore_budget=True,
+            )
+            print(msg)
+            if not ok and isinstance(meta, dict):
+                failures = meta.get('failures', [])
+                for f in failures[:20]:
+                    print(f"  - {f.get('ticker', '')}: {f.get('message', '')}")
             _pause()
             continue
 
@@ -1062,6 +1087,21 @@ def _prompt_optimizer_cost_col(settings: dict) -> str:
         return 'current_price'
     settings['strategy_optimizer_cost_col'] = 'target_bid'
     return 'target_bid'
+
+
+def _prompt_portfolio_eval_mode(settings: dict) -> str:
+    """Choose which portfolio to evaluate in Monte Carlo/win-prob diagnostics."""
+    current = calculations.resolve_portfolio_eval_mode(settings.get('strategy_portfolio_eval_mode', 'optimizer_selected'))
+    print('\nPortfolio evaluation mode:')
+    print('  [1] Optimizer-selected portfolio')
+    print('  [2] Fixed paid portfolio (active user assignments)')
+    print(f'Current/default: {current}')
+    choice = _prompt('Choice (Enter to keep default): ').strip()
+    if choice == '2':
+        settings['strategy_portfolio_eval_mode'] = 'fixed_active_paid'
+        return 'fixed_active_paid'
+    settings['strategy_portfolio_eval_mode'] = 'optimizer_selected'
+    return 'optimizer_selected'
 
 
 def _prompt_risk_model(settings: dict) -> str:
@@ -1288,6 +1328,7 @@ def menu_draft_strategy_dashboard():
 
     budget_mode, custom_budget = _prompt_budget_inputs(people_df, settings)
     optimizer_cost_col = _prompt_optimizer_cost_col(settings)
+    portfolio_eval_mode = _prompt_portfolio_eval_mode(settings)
     prob_bid_col, prob_value_col = calculations.resolve_probability_anchor_columns(optimizer_cost_col)
     _prompt_strategy_advanced_controls(settings, optimizer_cost_col)
     run_seed, run_seed_mode = _resolve_runtime_seed_for_run(settings)
@@ -1358,25 +1399,50 @@ def menu_draft_strategy_dashboard():
         effective_cost_col = 'target_bid'
         print('\n[Note] `market_fair_bid` unavailable/insufficient. Fell back to `target_bid` for optimizer.')
 
-    win_eval = None
-    if objective != 'win_probability':
+    eval_portfolio = opt.get('selected', pd.DataFrame()).copy()
+    eval_portfolio_label = 'optimizer_selected'
+    eval_portfolio_meta: dict = {}
+    if portfolio_eval_mode == 'fixed_active_paid':
+        active_user = str(settings.get('strategy_user_name', '') or '').strip()
+        assigned_df = storage.get_assigned_movies_df()
+        fixed_df, fixed_meta = calculations.build_fixed_paid_portfolio(
+            strategy_df=dashboard,
+            assigned_df=assigned_df,
+            active_user=active_user,
+        )
+        eval_portfolio_meta = fixed_meta
+        if fixed_df.empty:
+            print('\n[Note] Fixed paid portfolio mode requested, but no eligible assigned movies were found.')
+            if not active_user:
+                print('  Active user is not set. Select a personal user first.')
+            else:
+                print(f'  Active user: {active_user}')
+            print('  Falling back to optimizer-selected portfolio for evaluation.')
+        else:
+            eval_portfolio = fixed_df
+            eval_portfolio_label = 'fixed_active_paid'
+
+    portfolio_win_eval = None
+    if not eval_portfolio.empty:
         try:
-            win_eval = calculations.estimate_portfolio_win_probability(
+            portfolio_win_eval = calculations.estimate_portfolio_win_probability(
                 strategy_df=dashboard,
-                portfolio_df=opt.get('selected', pd.DataFrame()),
+                portfolio_df=eval_portfolio,
                 budget=basis_budget,
                 settings=tuned_settings,
                 risk_model=risk_model,
                 cost_col=opt.get('cost_col', effective_cost_col),
+                portfolio_cost_col='optimizer_cost',
             )
         except Exception:
-            win_eval = None
+            portfolio_win_eval = None
 
     sim = calculations.simulate_portfolio_monte_carlo(
         strategy_df=dashboard,
-        portfolio_df=opt['selected'],
+        portfolio_df=eval_portfolio,
         settings=tuned_settings,
         risk_model=risk_model,
+        cost_col='optimizer_cost',
     )
 
     selected_tickers = set(opt['selected']['ticker'].tolist()) if not opt['selected'].empty else set()
@@ -1477,6 +1543,13 @@ def menu_draft_strategy_dashboard():
         f"  Probability basis: bid={meta.get('prob_bid_col', 'target_bid')}  "
         f"value={meta.get('prob_value_col', 'fair_budget_bid')}"
     )
+    print(f"  Evaluation portfolio: {eval_portfolio_label}")
+    if eval_portfolio_label == 'fixed_active_paid':
+        print(
+            f"    active_user={eval_portfolio_meta.get('active_user', '')}  "
+            f"paid_rows={eval_portfolio_meta.get('rows_with_paid_price', 0)}  "
+            f"with_metrics={eval_portfolio_meta.get('rows_with_metrics', 0)}"
+        )
     cap_pct = pd.to_numeric(pd.Series([opt.get('max_budget_pct_per_film', np.nan)]), errors='coerce').iloc[0]
     if pd.notna(cap_pct):
         print(f"  Per-film cap: {100.0 * float(cap_pct):.1f}% of budget")
@@ -1513,14 +1586,28 @@ def menu_draft_strategy_dashboard():
         )
         if pd.notna(opt.get('seed_used', np.nan)):
             print(f"  Win-prob seed: {opt.get('seed_mode', run_seed_mode)} ({int(opt.get('seed_used'))})")
-    elif isinstance(win_eval, dict):
+    if isinstance(portfolio_win_eval, dict):
+        tag = 'selected portfolio' if eval_portfolio_label == 'optimizer_selected' else 'fixed paid portfolio'
         print(
-            f"  Estimated win probability (selected portfolio): {_fmt_prob(win_eval.get('win_probability'), 8)}  "
-            f"(vs {win_eval.get('opponent_count', 0)} simulated opponents)"
+            f"  Estimated win probability ({tag}): {_fmt_prob(portfolio_win_eval.get('win_probability'), 8)}  "
+            f"(vs {portfolio_win_eval.get('opponent_count', 0)} simulated opponents)"
         )
-        if pd.notna(win_eval.get('seed_used', np.nan)):
-            print(f"  Win-prob seed: {win_eval.get('seed_mode', run_seed_mode)} ({int(win_eval.get('seed_used'))})")
-    eval_meta = opt if objective == 'win_probability' else (win_eval if isinstance(win_eval, dict) else {})
+        if pd.notna(portfolio_win_eval.get('seed_used', np.nan)):
+            print(
+                f"  Win-prob seed ({tag}): "
+                f"{portfolio_win_eval.get('seed_mode', run_seed_mode)} ({int(portfolio_win_eval.get('seed_used'))})"
+            )
+        pbf = pd.to_numeric(pd.Series([portfolio_win_eval.get('portfolio_budget_feasible', np.nan)]), errors='coerce').iloc[0]
+        pspend = pd.to_numeric(pd.Series([portfolio_win_eval.get('selected_portfolio_spend', np.nan)]), errors='coerce').iloc[0]
+        if pd.notna(pspend):
+            print(
+                f"  Eval portfolio spend={_fmt(pspend)}  "
+                f"budget_feasible={'yes' if (pd.isna(pbf) or bool(pbf)) else 'no'}"
+            )
+    eval_meta = (
+        opt if (objective == 'win_probability' and eval_portfolio_label == 'optimizer_selected')
+        else (portfolio_win_eval if isinstance(portfolio_win_eval, dict) else (opt if objective == 'win_probability' else {}))
+    )
     if isinstance(eval_meta, dict):
         search_mode_used = str(eval_meta.get('search_mode_used', tuned_settings.get('strategy_search_mode', 'current_sampled')))
         cand_eval = pd.to_numeric(pd.Series([eval_meta.get('candidate_count_evaluated', np.nan)]), errors='coerce').iloc[0]
@@ -1585,18 +1672,19 @@ def menu_draft_strategy_dashboard():
                 f"P(surplus>0)={_fmt_prob(row.get('prob_positive_surplus'), 8)}"
             )
 
-    if not opt['selected'].empty:
-        print('\nSelected portfolio:')
-        for _, row in opt['selected'].iterrows():
+    if not eval_portfolio.empty:
+        heading = 'Selected portfolio' if eval_portfolio_label == 'optimizer_selected' else 'Evaluation portfolio (fixed paid)'
+        print(f'\n{heading}:')
+        for _, row in eval_portfolio.iterrows():
             eff = pd.to_numeric(pd.Series([row.get('eff_per_dollar', np.nan)]), errors='coerce').iloc[0]
             if pd.isna(eff):
                 cost = pd.to_numeric(pd.Series([row.get('optimizer_cost', np.nan)]), errors='coerce').iloc[0]
                 adj = pd.to_numeric(pd.Series([row.get('adjusted_expected', np.nan)]), errors='coerce').iloc[0]
                 eff = (adj / cost) if pd.notna(cost) and cost > 0 and pd.notna(adj) else np.nan
             print(
-                f"  {row['ticker']:<8}  bid=${row['target_bid']:.2f}  "
-                f"cost=${row['optimizer_cost']:.2f}  "
-                f"adj={row['adjusted_expected']:.2f}  eff/$={float(eff):.2f}"
+                f"  {row['ticker']:<8}  bid=${float(pd.to_numeric(pd.Series([row.get('target_bid', np.nan)]), errors='coerce').fillna(0.0).iloc[0]):.2f}  "
+                f"cost=${float(pd.to_numeric(pd.Series([row.get('optimizer_cost', np.nan)]), errors='coerce').fillna(0.0).iloc[0]):.2f}  "
+                f"adj={float(pd.to_numeric(pd.Series([row.get('adjusted_expected', np.nan)]), errors='coerce').fillna(0.0).iloc[0]):.2f}  eff/$={float(eff):.2f}"
             )
 
     if not opt['alternates'].empty:

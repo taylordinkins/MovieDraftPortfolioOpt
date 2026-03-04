@@ -184,6 +184,10 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.prev_bid_spin.setRange(0, 100000)
         controls.addWidget(QtWidgets.QLabel("Previous Bid"), 1, 7)
         controls.addWidget(self.prev_bid_spin, 1, 8)
+        controls.addWidget(QtWidgets.QLabel("Portfolio Eval"), 1, 9)
+        self.portfolio_eval_combo = QtWidgets.QComboBox()
+        self.portfolio_eval_combo.addItems(["optimizer_selected", "fixed_active_paid"])
+        controls.addWidget(self.portfolio_eval_combo, 1, 10)
 
         self.dashboard_context_label = QtWidgets.QLabel("Draft context: -")
         controls.addWidget(self.dashboard_context_label, 2, 0, 1, 6)
@@ -535,6 +539,10 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self._set_combo_value(self.risk_combo, str(settings.get("strategy_risk_model", "bootstrap")))
         self._set_combo_value(self.objective_combo, str(settings.get("strategy_objective", "expected_gross")))
         self._set_combo_value(self.cost_combo, str(settings.get("strategy_optimizer_cost_col", "target_bid")))
+        self._set_combo_value(
+            self.portfolio_eval_combo,
+            str(settings.get("strategy_portfolio_eval_mode", "optimizer_selected")),
+        )
         self._set_combo_value(self.budget_mode_combo, str(settings.get("strategy_budget_mode_preference", "personal")))
         self.custom_budget_spin.setValue(float(settings.get("strategy_custom_budget_amount", 200.0)))
 
@@ -612,6 +620,9 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         settings["strategy_budget_mode_preference"] = self.budget_mode_combo.currentText().strip().lower()
         settings["strategy_custom_budget_amount"] = float(self.custom_budget_spin.value())
         settings["strategy_optimizer_cost_col"] = self.cost_combo.currentText().strip()
+        settings["strategy_portfolio_eval_mode"] = calculations.resolve_portfolio_eval_mode(
+            self.portfolio_eval_combo.currentText().strip()
+        )
         settings["strategy_lambda"] = float(self.lambda_spin.value())
         settings["strategy_clip_low"] = float(self.clip_low_spin.value())
         settings["strategy_clip_high"] = float(self.clip_high_spin.value())
@@ -744,6 +755,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             previous_bid = int(self.prev_bid_spin.value())
             budget_mode = self.budget_mode_combo.currentText().strip().lower()
             cost_col = self.cost_combo.currentText().strip()
+            portfolio_eval_mode = calculations.resolve_portfolio_eval_mode(self.portfolio_eval_combo.currentText().strip())
             prob_bid_col, prob_value_col = calculations.resolve_probability_anchor_columns(cost_col)
             custom_budget = float(self.custom_budget_spin.value()) if budget_mode == "custom" else None
             if budget_mode == "custom":
@@ -757,6 +769,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             settings["strategy_budget_mode_preference"] = self.budget_mode_combo.currentText().strip().lower()
             settings["strategy_custom_budget_amount"] = float(self.custom_budget_spin.value())
             settings["strategy_optimizer_cost_col"] = cost_col
+            settings["strategy_portfolio_eval_mode"] = portfolio_eval_mode
             _set_with_override("strategy_lambda", float(self.lambda_spin.value()))
             _set_with_override("strategy_bid_multiplier", float(self.bid_mult_spin.value()))
             _set_with_override("strategy_max_budget_pct_per_film", float(self.base_cap_spin.value()))
@@ -860,25 +873,46 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                         settings=tuned,
                         cost_col="target_bid",
                     )
-            win_eval = None
-            if objective != "win_probability":
+            eval_portfolio = opt.get("selected", pd.DataFrame()).copy()
+            eval_portfolio_label = "optimizer_selected"
+            eval_portfolio_meta: dict = {}
+            fixed_eval_fallback = False
+            if portfolio_eval_mode == "fixed_active_paid":
+                active_user = str(settings.get("strategy_user_name", "") or "").strip()
+                assigned_df = storage.get_assigned_movies_df()
+                fixed_df, fixed_meta = calculations.build_fixed_paid_portfolio(
+                    strategy_df=dashboard,
+                    assigned_df=assigned_df,
+                    active_user=active_user,
+                )
+                eval_portfolio_meta = fixed_meta
+                if not fixed_df.empty:
+                    eval_portfolio = fixed_df
+                    eval_portfolio_label = "fixed_active_paid"
+                else:
+                    fixed_eval_fallback = True
+
+            portfolio_win_eval = None
+            if not eval_portfolio.empty:
                 try:
-                    win_eval = calculations.estimate_portfolio_win_probability(
+                    portfolio_win_eval = calculations.estimate_portfolio_win_probability(
                         strategy_df=dashboard,
-                        portfolio_df=opt.get("selected", pd.DataFrame()),
+                        portfolio_df=eval_portfolio,
                         budget=basis_budget,
                         settings=tuned,
                         risk_model=risk_model,
                         cost_col=opt.get("cost_col", cost_col),
+                        portfolio_cost_col="optimizer_cost",
                     )
                 except Exception:
-                    win_eval = None
+                    portfolio_win_eval = None
 
             sim = calculations.simulate_portfolio_monte_carlo(
                 strategy_df=dashboard,
-                portfolio_df=opt.get("selected", pd.DataFrame()),
+                portfolio_df=eval_portfolio,
                 settings=tuned,
                 risk_model=risk_model,
+                cost_col="optimizer_cost",
             )
 
             selected_tickers = set(opt.get("selected", pd.DataFrame()).get("ticker", pd.Series(dtype=object)).astype(str))
@@ -907,7 +941,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             self.dashboard_model.set_dataframe(display_df)
             self._autosize_table_columns(self.dashboard_table)
 
-            selected = opt.get("selected", pd.DataFrame()).copy()
+            selected = eval_portfolio.copy()
             sel_cols = [c for c in ["ticker", "target_bid", "optimizer_cost", "adjusted_expected", "eff_per_dollar"] if c in selected.columns]
             self.selected_model.set_dataframe(selected[sel_cols] if sel_cols else selected)
             self._autosize_table_columns(self.selected_table)
@@ -924,7 +958,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                     return default
                 return f"{float(v):.{decimals}f}"
 
-            selected_df = opt.get("selected", pd.DataFrame()).copy()
+            selected_df = eval_portfolio.copy()
             alternates_df = opt.get("alternates", pd.DataFrame()).copy()
             if not selected_df.empty and "eff_per_dollar" not in selected_df.columns:
                 c = pd.to_numeric(selected_df.get("optimizer_cost", np.nan), errors="coerce")
@@ -934,7 +968,10 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                 c = pd.to_numeric(alternates_df.get("optimizer_cost", np.nan), errors="coerce")
                 a = pd.to_numeric(alternates_df.get("adjusted_expected", np.nan), errors="coerce")
                 alternates_df["eff_per_dollar"] = np.where(c > 0, a / c, np.nan)
-            eval_meta = opt if objective == "win_probability" else (win_eval if isinstance(win_eval, dict) else {})
+            eval_meta = (
+                opt if (objective == "win_probability" and eval_portfolio_label == "optimizer_selected")
+                else (portfolio_win_eval if isinstance(portfolio_win_eval, dict) else (opt if objective == "win_probability" else {}))
+            )
 
             text = [
                 "=== Draft Strategy Dashboard ===",
@@ -943,8 +980,17 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                 f"Seed mode: {run_seed_mode} | Seed used: {run_seed}",
                 f"Cost basis: {cost_col}",
                 f"Probability basis: bid={meta.get('prob_bid_col', 'target_bid')} | value={meta.get('prob_value_col', 'fair_budget_bid')}",
+                f"Evaluation portfolio: {eval_portfolio_label}",
                 f"Valuation controls: lambda={float(tuned.get('strategy_lambda', 0.35)):.2f} | clip=[{float(tuned.get('strategy_clip_low', 0.85)):.2f}, {float(tuned.get('strategy_clip_high', 1.15)):.2f}]",
             ]
+            if eval_portfolio_label == "fixed_active_paid":
+                text.append(
+                    f"Fixed portfolio user={eval_portfolio_meta.get('active_user', '')} | "
+                    f"paid_rows={int(eval_portfolio_meta.get('rows_with_paid_price', 0))} | "
+                    f"with_metrics={int(eval_portfolio_meta.get('rows_with_metrics', 0))}"
+                )
+            elif fixed_eval_fallback:
+                text.append("Fixed paid portfolio requested but no eligible paid assignments found; using optimizer-selected portfolio.")
             if integer_mode:
                 text.append(f"Integer bid rules: whole number, > {previous_bid}, <= remaining budget")
                 if previous_bid > 0:
@@ -965,11 +1011,19 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                     f"Estimated win probability: {_pct(opt.get('win_probability'))} "
                     f"(vs {int(opt.get('opponent_count', 0))} simulated opponents)"
                 )
-            elif isinstance(win_eval, dict):
+            if isinstance(portfolio_win_eval, dict):
+                tag = "selected portfolio" if eval_portfolio_label == "optimizer_selected" else "fixed paid portfolio"
                 text.append(
-                    f"Estimated win probability (selected portfolio): {_pct(win_eval.get('win_probability'))} "
-                    f"(vs {int(win_eval.get('opponent_count', 0))} simulated opponents)"
+                    f"Estimated win probability ({tag}): {_pct(portfolio_win_eval.get('win_probability'))} "
+                    f"(vs {int(portfolio_win_eval.get('opponent_count', 0))} simulated opponents)"
                 )
+                spend = pd.to_numeric(pd.Series([portfolio_win_eval.get("selected_portfolio_spend", np.nan)]), errors="coerce").iloc[0]
+                feasible = pd.to_numeric(pd.Series([portfolio_win_eval.get("portfolio_budget_feasible", np.nan)]), errors="coerce").iloc[0]
+                if pd.notna(spend):
+                    text.append(
+                        f"Eval portfolio spend={_fmt_money(spend)} | "
+                        f"budget_feasible={'yes' if (pd.isna(feasible) or bool(feasible)) else 'no'}"
+                    )
             qf = opt.get("quality_filter_info", {})
             if isinstance(qf, dict) and qf.get("enabled"):
                 text.append(
@@ -984,7 +1038,11 @@ class DraftToolWindow(QtWidgets.QMainWindow):
                 no_legal = int((pd.to_numeric(dashboard.get("can_bid_int", True), errors="coerce") == 0).sum())
                 text.append(f"Integer mode: total rounding drift={drift:+.2f}  no-legal-bid rows={no_legal}")
 
-            text.extend(["", "Selected portfolio (top picks):"])
+            text.extend([
+                "",
+                "Selected portfolio (top picks):" if eval_portfolio_label == "optimizer_selected"
+                else "Evaluation portfolio (fixed paid):"
+            ])
             if selected_df.empty:
                 text.append("None selected.")
             else:
@@ -1053,10 +1111,10 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             p_conc = pd.to_numeric(pd.Series([sim.get("concentration_downside_prob", np.nan)]), errors="coerce").iloc[0]
             left = pd.to_numeric(pd.Series([opt.get("leftover", np.nan)]), errors="coerce").iloc[0]
             win_p = np.nan
-            if objective == "win_probability":
+            if eval_portfolio_label == "optimizer_selected" and objective == "win_probability":
                 win_p = pd.to_numeric(pd.Series([opt.get("win_probability", np.nan)]), errors="coerce").iloc[0]
-            elif isinstance(win_eval, dict):
-                win_p = pd.to_numeric(pd.Series([win_eval.get("win_probability", np.nan)]), errors="coerce").iloc[0]
+            elif isinstance(portfolio_win_eval, dict):
+                win_p = pd.to_numeric(pd.Series([portfolio_win_eval.get("win_probability", np.nan)]), errors="coerce").iloc[0]
 
             if pd.notna(p_below):
                 if p_below > 0.20:
@@ -1179,6 +1237,9 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         btn_unassign = QtWidgets.QPushButton("Unassign")
         btn_unassign.clicked.connect(self.on_unassign_movie)
         ops.addWidget(btn_unassign, 1, 2)
+        btn_clear_all = QtWidgets.QPushButton("Clear All Assignments")
+        btn_clear_all.clicked.connect(self.on_clear_all_assignments)
+        ops.addWidget(btn_clear_all, 1, 3)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         root.addWidget(splitter, 1)
@@ -1312,6 +1373,35 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             self.refresh_all()
         else:
             self._show_error(msg)
+
+    def on_clear_all_assignments(self):
+        assigned = storage.get_assigned_movies_df()
+        if assigned.empty:
+            self._show_error("No assignments to clear.")
+            return
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Clear All Assignments",
+            "This will unassign all movies and restore applied budgets where possible. Continue?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+        ok, msg, meta = storage.clear_all_assignments(
+            source="gui_clear_all",
+            restore_budget=True,
+        )
+        if ok:
+            self._set_status(msg)
+            self.refresh_all()
+            return
+        failures = meta.get("failures", []) if isinstance(meta, dict) else []
+        detail = "\n".join(
+            f"{str(f.get('ticker', ''))}: {str(f.get('message', ''))}" for f in failures[:20]
+        )
+        self._show_error(msg, detail=detail)
+        self.refresh_all()
 
     # ---------- History ----------
 

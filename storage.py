@@ -84,6 +84,7 @@ _DEFAULT_SETTINGS = {
     'strategy_budget_mode_preference': 'personal',  # personal | league | custom
     'strategy_custom_budget_amount': 200.0,
     'strategy_optimizer_cost_col': 'target_bid',  # target_bid | market_fair_bid | current_price
+    'strategy_portfolio_eval_mode': 'optimizer_selected',  # optimizer_selected | fixed_active_paid
     # Integer bid constraint toggle.
     'strategy_integer_bid_mode': False,
     'strategy_integer_prev_bid': 0,
@@ -629,3 +630,49 @@ def unassign_movie(
     if budget_restored and prev_winner and prev_price is not None:
         msg += f' Restored ${prev_price:.2f} to {prev_winner}.'
     return True, msg, existing
+
+
+def clear_all_assignments(
+    source: str = 'cli',
+    restore_budget: bool = True,
+) -> tuple[bool, str, dict]:
+    """
+    Unassign all currently assigned movies.
+    Optionally restores winner budgets for entries with applied final_price.
+    Returns (success, message, metadata).
+    """
+    assigned = get_assigned_movies_df()
+    if assigned.empty:
+        return True, 'No assignments to clear.', {
+            'total': 0,
+            'cleared': 0,
+            'failed': 0,
+            'failures': [],
+        }
+
+    tickers = assigned.get('ticker', pd.Series(dtype=object)).astype(str).str.upper().tolist()
+    cleared = 0
+    failures: list[dict] = []
+    for ticker in tickers:
+        ok, msg, _ = unassign_movie(
+            ticker=ticker,
+            source=source,
+            restore_budget=restore_budget,
+        )
+        if ok:
+            cleared += 1
+        else:
+            failures.append({'ticker': ticker, 'message': msg})
+
+    total = len(tickers)
+    failed = len(failures)
+    success = failed == 0
+    status = f'Cleared {cleared}/{total} assignments.'
+    if failed:
+        status += f' Failed: {failed}.'
+    return success, status, {
+        'total': total,
+        'cleared': cleared,
+        'failed': failed,
+        'failures': failures,
+    }
