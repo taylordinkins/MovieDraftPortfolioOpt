@@ -1226,10 +1226,12 @@ def _prompt_strategy_advanced_controls(settings: dict, optimizer_cost_col: str) 
 
     _ask_int('strategy_mc_samples', 'Monte Carlo samples', 100, 20000)
     _ask_int('strategy_mc_num_opponents', 'Monte Carlo opponents', 1, 30)
+    _ask_int('strategy_mc_opponent_universes', 'Monte Carlo universes (robustness)', 1, 100)
     _ask_int('strategy_mc_candidate_portfolios', 'MC candidate portfolios', 20, 2000)
     _ask_int('strategy_search_candidates', 'Search candidates (Phase 4)', 20, 5000)
     _ask_float('strategy_mc_opponent_noise', 'MC opponent noise (0.01-1.00)', 0.01, 1.00)
     _ask_float('strategy_mc_aggression_sd', 'MC opponent aggression stdev (0-1)', 0.0, 1.0)
+    _ask_float('strategy_min_return_volatility', 'Min return volatility floor (0=raw history, 0.15=recommended)', 0.0, 1.0)
     _ask_float('strategy_mc_concentration_threshold', 'MC concentration downside threshold (0-1)', 0.0, 1.0)
     cur_seed_mode = str(settings.get('strategy_mc_seed_mode', 'fixed')).strip().lower()
     print(f"Seed mode: current={cur_seed_mode}  [1] fixed  [2] random")
@@ -1483,13 +1485,13 @@ def menu_draft_strategy_dashboard():
 
     if integer_bid_mode:
         header = (
-            f"{'Ticker':<8}  {'Price':>7}  {'AdjMult':>7}  {'AdjExp':>7}  {'TgtInt':>7}  {'TgtMktInt':>9}  "
+            f"{'Ticker':<8}  {'Price':>7}  {'AdjMult':>7}  {'AdjExp':>7}  {'MktFair':>7}  {'TgtInt':>7}  {'TgtMktInt':>9}  "
             f"{'MaxInt':>7}  {'MinBid':>7}  {'Risk%':>7}  "
             f"{'P(Edge)':>8}  {'P(DD)':>8}  {'DealQ':>7}  {'Score':>7}  {'Opt':>3}"
         )
     else:
         header = (
-            f"{'Ticker':<8}  {'Price':>7}  {'AdjMult':>7}  {'AdjExp':>7}  {'TgtBid':>7}  {'TgtMkt':>7}  "
+            f"{'Ticker':<8}  {'Price':>7}  {'AdjMult':>7}  {'AdjExp':>7}  {'MktFair':>7}  {'TgtBid':>7}  {'TgtMkt':>7}  "
             f"{'MaxBid':>7}  {'Risk%':>7}  {'P(Edge)':>8}  {'P(DD)':>8}  "
             f"{'DealQ':>7}  {'Score':>7}  {'Opt':>3}"
         )
@@ -1503,6 +1505,7 @@ def menu_draft_strategy_dashboard():
                 f"{_fmt(row.get('current_price'))}  "
                 f"{_fmt(row.get('adjustment_multiplier'))}  "
                 f"{_fmt(row.get('adjusted_expected'))}  "
+                f"{_fmt(row.get('market_fair_bid'))}  "
                 f"{row.get('target_bid_int', ''):>7}  "
                 f"{row.get('target_market_bid_int', ''):>9}  "
                 f"{row.get('max_bid_int', ''):>7}  "
@@ -1520,6 +1523,7 @@ def menu_draft_strategy_dashboard():
                 f"{_fmt(row.get('current_price'))}  "
                 f"{_fmt(row.get('adjustment_multiplier'))}  "
                 f"{_fmt(row.get('adjusted_expected'))}  "
+                f"{_fmt(row.get('market_fair_bid'))}  "
                 f"{_fmt(row.get('target_bid'))}  "
                 f"{_fmt(row.get('target_market_bid'))}  "
                 f"{_fmt(row.get('max_bid'))}  "
@@ -1580,18 +1584,28 @@ def menu_draft_strategy_dashboard():
         clipped_count = int((pd.to_numeric(dashboard.get('can_bid_int', True), errors='coerce') == 0).sum())
         print(f"  Integer mode: total rounding drift={rounding_drift:+.2f}  no-legal-bid rows={clipped_count}")
     if objective == 'win_probability':
+        opp_eff = int(opt.get('opponent_count', 0))
+        opp_req = int(opt.get('n_opp_requested', opp_eff))
         print(
             f"  Estimated win probability: {_fmt_prob(opt.get('win_probability'), 8)}  "
-            f"(vs {opt.get('opponent_count', 0)} simulated opponents)"
+            f"(vs {opp_eff}/{opp_req} simulated opponents)"
         )
+        wp = pd.to_numeric(pd.Series([opt.get('win_probability', np.nan)]), errors='coerce').iloc[0]
+        if pd.notna(wp) and wp >= 0.95 and opp_req > 0 and opp_eff < opp_req * 0.75:
+            print(f"  [!] Win probability is based on only {opp_eff} of {opp_req} opponents with movies — pool may be depleted.")
         if pd.notna(opt.get('seed_used', np.nan)):
             print(f"  Win-prob seed: {opt.get('seed_mode', run_seed_mode)} ({int(opt.get('seed_used'))})")
     if isinstance(portfolio_win_eval, dict):
         tag = 'selected portfolio' if eval_portfolio_label == 'optimizer_selected' else 'fixed paid portfolio'
+        eff2 = int(portfolio_win_eval.get('opponent_count', 0))
+        req2 = int(portfolio_win_eval.get('n_opp_requested', eff2))
         print(
             f"  Estimated win probability ({tag}): {_fmt_prob(portfolio_win_eval.get('win_probability'), 8)}  "
-            f"(vs {portfolio_win_eval.get('opponent_count', 0)} simulated opponents)"
+            f"(vs {eff2}/{req2} simulated opponents)"
         )
+        wp2 = pd.to_numeric(pd.Series([portfolio_win_eval.get('win_probability', np.nan)]), errors='coerce').iloc[0]
+        if pd.notna(wp2) and wp2 >= 0.95 and req2 > 0 and eff2 < req2 * 0.75:
+            print(f"  [!] Win probability is based on only {eff2} of {req2} opponents with movies — pool may be depleted.")
         if pd.notna(portfolio_win_eval.get('seed_used', np.nan)):
             print(
                 f"  Win-prob seed ({tag}): "
@@ -1621,6 +1635,7 @@ def menu_draft_strategy_dashboard():
         print('  ' + '  '.join(search_parts).strip())
         print(
             f"  Opponent profile: {opp_profile_used}  "
+            f"universes={int(eval_meta.get('opponent_universes', 1))}  "
             f"bidup={float(tuned_settings.get('strategy_opponent_bidup_strength', 0.0)):.2f}  "
             f"cash_conserve={float(tuned_settings.get('strategy_opponent_cash_conservation', 0.0)):.2f}"
         )
@@ -1660,6 +1675,7 @@ def menu_draft_strategy_dashboard():
         f"  prob_samples={int(tuned_settings.get('strategy_bootstrap_samples', 1000))}  "
         f"opp_noise={float(tuned_settings.get('strategy_mc_opponent_noise', 0.30)):.2f}  "
         f"opp_aggr_sd={float(tuned_settings.get('strategy_mc_aggression_sd', 0.10)):.2f}  "
+        f"min_vol={float(tuned_settings.get('strategy_min_return_volatility', 0.15)):.2f}  "
         f"conc_threshold={_fmt_prob(tuned_settings.get('strategy_mc_concentration_threshold', 0.40), 7)}"
     )
     agg = sim.get('aggression_sensitivity')

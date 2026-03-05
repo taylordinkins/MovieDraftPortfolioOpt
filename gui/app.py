@@ -85,6 +85,23 @@ class MplCanvas(FigureCanvasQTAgg):
         super().__init__(self.figure)
 
 
+class DashboardWorker(QtCore.QThread):
+    progress = QtCore.Signal(float, str)
+    finished = QtCore.Signal(dict)
+    error = QtCore.Signal(str)
+
+    def __init__(self, run_fn):
+        super().__init__()
+        self.run_fn = run_fn
+
+    def run(self):
+        try:
+            result = self.run_fn(self.progress.emit)
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(f"{str(e)}\n{traceback.format_exc()}")
+
+
 class DraftToolWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -192,9 +209,19 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.dashboard_context_label = QtWidgets.QLabel("Draft context: -")
         controls.addWidget(self.dashboard_context_label, 2, 0, 1, 6)
 
-        run_btn = QtWidgets.QPushButton("Run Dashboard")
-        run_btn.clicked.connect(self.run_dashboard)
-        controls.addWidget(run_btn, 2, 7, 1, 2)
+        self.run_btn = QtWidgets.QPushButton("Run Dashboard")
+        self.run_btn.clicked.connect(self.run_dashboard)
+        controls.addWidget(self.run_btn, 2, 7, 1, 2)
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)
+        controls.addWidget(self.progress_bar, 2, 9, 1, 2)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setStyleSheet("color: #555; font-style: italic;")
+        controls.addWidget(self.status_label, 2, 0, 1, 7) # Replace/overlap context if needed, but context is at 2,0,1,6
 
         # Advanced knobs (high-impact tuning controls).
         controls.addWidget(QtWidgets.QLabel("Bid Mult"), 3, 0)
@@ -350,6 +377,37 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.seed_spin.setRange(0, 2_147_483_647)
         controls.addWidget(self.seed_spin, 7, 5)
 
+        controls.addWidget(QtWidgets.QLabel("MC Universes"), 7, 6)
+        self.mc_universes_spin = QtWidgets.QSpinBox()
+        self.mc_universes_spin.setRange(1, 100)
+        self.mc_universes_spin.setToolTip("Number of different opponent draft universes to average over for robust win-probability estimation.")
+        controls.addWidget(self.mc_universes_spin, 7, 7)
+
+        controls.addWidget(QtWidgets.QLabel("Min Vol Floor"), 7, 8)
+        self.min_vol_spin = QtWidgets.QDoubleSpinBox()
+        self.min_vol_spin.setRange(0.0, 1.0)
+        self.min_vol_spin.setDecimals(2)
+        self.min_vol_spin.setSingleStep(0.05)
+        self.min_vol_spin.setToolTip(
+            "Minimum return volatility floor for MC simulation (0 = use raw historical variance).\n"
+            "Pre-release HSX prices have ~1-2% std; 0.15 adds realistic box-office uncertainty."
+        )
+        controls.addWidget(self.min_vol_spin, 7, 9)
+
+        controls.addWidget(QtWidgets.QLabel("Clip Low"), 7, 10)
+        self.clip_low_spin = QtWidgets.QDoubleSpinBox()
+        self.clip_low_spin.setRange(0.5, 1.5)
+        self.clip_low_spin.setDecimals(2)
+        self.clip_low_spin.setSingleStep(0.05)
+        controls.addWidget(self.clip_low_spin, 7, 11)
+
+        controls.addWidget(QtWidgets.QLabel("Clip High"), 7, 12)
+        self.clip_high_spin = QtWidgets.QDoubleSpinBox()
+        self.clip_high_spin.setRange(0.8, 2.5)
+        self.clip_high_spin.setDecimals(2)
+        self.clip_high_spin.setSingleStep(0.05)
+        controls.addWidget(self.clip_high_spin, 7, 13)
+
         controls.addWidget(QtWidgets.QLabel("Corr Mode"), 8, 0)
         self.corr_mode_combo = QtWidgets.QComboBox()
         self.corr_mode_combo.addItems(["independent", "gaussian_copula", "t_copula"])
@@ -378,20 +436,6 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.corr_t_df_spin = QtWidgets.QSpinBox()
         self.corr_t_df_spin.setRange(3, 60)
         controls.addWidget(self.corr_t_df_spin, 8, 9)
-
-        controls.addWidget(QtWidgets.QLabel("Clip Low"), 7, 6)
-        self.clip_low_spin = QtWidgets.QDoubleSpinBox()
-        self.clip_low_spin.setRange(0.5, 1.5)
-        self.clip_low_spin.setDecimals(2)
-        self.clip_low_spin.setSingleStep(0.05)
-        controls.addWidget(self.clip_low_spin, 7, 7)
-
-        controls.addWidget(QtWidgets.QLabel("Clip High"), 7, 8)
-        self.clip_high_spin = QtWidgets.QDoubleSpinBox()
-        self.clip_high_spin.setRange(0.8, 2.5)
-        self.clip_high_spin.setDecimals(2)
-        self.clip_high_spin.setSingleStep(0.05)
-        controls.addWidget(self.clip_high_spin, 7, 9)
 
         controls.addWidget(QtWidgets.QLabel("Search Mode"), 9, 0)
         self.search_mode_combo = QtWidgets.QComboBox()
@@ -565,6 +609,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.clip_high_spin.setValue(float(settings.get("strategy_clip_high", 1.15)))
         self.mc_samples_spin.setValue(int(settings.get("strategy_mc_samples", 1500)))
         self.mc_opp_spin.setValue(int(settings.get("strategy_mc_num_opponents", 7)))
+        self.mc_universes_spin.setValue(int(settings.get("strategy_mc_opponent_universes", 25)))
         self.mc_candidates_spin.setValue(int(settings.get("strategy_mc_candidate_portfolios", 120)))
         self.risk_a_spin.setValue(float(settings.get("strategy_risk_a_vol", 3.00)))
         self.risk_b_spin.setValue(float(settings.get("strategy_risk_b_drawdown", 1.40)))
@@ -579,6 +624,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         self.mc_conc_spin.setValue(float(settings.get("strategy_mc_concentration_threshold", 0.40)))
         self._set_combo_value(self.seed_mode_combo, str(settings.get("strategy_mc_seed_mode", "fixed")))
         self.seed_spin.setValue(int(settings.get("strategy_mc_random_seed", 123)))
+        self.min_vol_spin.setValue(float(settings.get("strategy_min_return_volatility", 0.15)))
         self.seed_spin.setEnabled(self.seed_mode_combo.currentText().strip().lower() == "fixed")
         self._set_combo_value(self.corr_mode_combo, str(settings.get("strategy_corr_simulation_mode", "independent")))
         self.corr_shrink_spin.setValue(float(settings.get("strategy_corr_shrinkage", 0.20)))
@@ -637,6 +683,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         settings["strategy_drawdown_threshold"] = float(self.dd_threshold_spin.value())
         settings["strategy_mc_samples"] = int(self.mc_samples_spin.value())
         settings["strategy_mc_num_opponents"] = int(self.mc_opp_spin.value())
+        settings["strategy_mc_opponent_universes"] = int(self.mc_universes_spin.value())
         settings["strategy_mc_candidate_portfolios"] = int(self.mc_candidates_spin.value())
         settings["strategy_search_candidates"] = int(self.search_candidates_spin.value())
         settings["strategy_risk_a_vol"] = float(self.risk_a_spin.value())
@@ -652,6 +699,7 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         settings["strategy_mc_concentration_threshold"] = float(self.mc_conc_spin.value())
         settings["strategy_mc_seed_mode"] = self.seed_mode_combo.currentText().strip().lower()
         settings["strategy_mc_random_seed"] = int(self.seed_spin.value())
+        settings["strategy_min_return_volatility"] = float(self.min_vol_spin.value())
         settings["strategy_corr_simulation_mode"] = self.corr_mode_combo.currentText().strip().lower()
         settings["strategy_corr_shrinkage"] = float(self.corr_shrink_spin.value())
         settings["strategy_corr_min_history_points"] = int(self.corr_min_points_spin.value())
@@ -719,6 +767,22 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             "Run Dashboard to compute strategy metrics, optimizer recommendations, and Monte Carlo diagnostics."
         )
 
+    def on_dashboard_progress(self, pct: float, status: str):
+        self.progress_bar.setValue(int(pct))
+        self.status_label.setText(status)
+
+    def on_dashboard_error(self, error_msg: str):
+        self._show_error(f"Dashboard calculation failed:\n{error_msg}")
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("Error occurred.")
+        self.run_btn.setEnabled(True)
+
+    def on_dashboard_finished(self, result: dict):
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("Complete.")
+        self.run_btn.setEnabled(True)
+        self._apply_dashboard_results(result)
+
     def run_dashboard(self):
         try:
             movies_df = storage.load_movies()
@@ -781,8 +845,11 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             _set_with_override("strategy_min_prob_positive_edge", float(self.min_edge_spin.value()))
             _set_with_override("strategy_max_prob_large_drawdown", float(self.max_dd_spin.value()))
             _set_with_override("strategy_drawdown_threshold", float(self.dd_threshold_spin.value()))
+            _set_with_override("strategy_clip_low", float(self.clip_low_spin.value()))
+            _set_with_override("strategy_clip_high", float(self.clip_high_spin.value()))
             _set_with_override("strategy_mc_samples", int(self.mc_samples_spin.value()))
             _set_with_override("strategy_mc_num_opponents", int(self.mc_opp_spin.value()))
+            _set_with_override("strategy_mc_opponent_universes", int(self.mc_universes_spin.value()))
             _set_with_override("strategy_mc_candidate_portfolios", int(self.mc_candidates_spin.value()))
             _set_with_override("strategy_risk_a_vol", float(self.risk_a_spin.value()))
             _set_with_override("strategy_risk_b_drawdown", float(self.risk_b_spin.value()))
@@ -797,10 +864,11 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             _set_with_override("strategy_mc_concentration_threshold", float(self.mc_conc_spin.value()))
             _set_with_override("strategy_mc_seed_mode", self.seed_mode_combo.currentText().strip().lower())
             _set_with_override("strategy_mc_random_seed", int(self.seed_spin.value()))
+            _set_with_override("strategy_mc_return_vol_floor", float(self.min_vol_spin.value()))
             _set_with_override("strategy_corr_simulation_mode", self.corr_mode_combo.currentText().strip().lower())
             _set_with_override("strategy_corr_shrinkage", float(self.corr_shrink_spin.value()))
-            _set_with_override("strategy_corr_min_history_points", int(self.corr_min_points_spin.value()))
-            _set_with_override("strategy_corr_floor", float(self.corr_floor_spin.value()))
+            _set_with_override("strategy_corr_min_points", int(self.corr_min_points_spin.value()))
+            _set_with_override("strategy_corr_psd_floor", float(self.corr_floor_spin.value()))
             _set_with_override("strategy_corr_t_df", int(self.corr_t_df_spin.value()))
             _set_with_override("strategy_search_mode", self.search_mode_combo.currentText().strip().lower())
             _set_with_override("strategy_search_candidates", int(self.search_candidates_spin.value()))
@@ -820,373 +888,146 @@ class DraftToolWindow(QtWidgets.QMainWindow):
             run_settings = dict(settings)
             run_settings["strategy_runtime_seed"] = int(run_seed)
 
-            dashboard, meta, tuned = calculations.build_strategy_dashboard(
-                hsx_df=cache_df,
-                movies_df=movies_df,
-                people_df=people_df,
-                settings=run_settings,
-                preset=preset,
-                budget_mode=budget_mode,
-                custom_budget=custom_budget,
-                risk_model=risk_model,
-                integer_bid_mode=integer_mode,
-                previous_bid=previous_bid,
-                prob_bid_col=prob_bid_col,
-                prob_value_col=prob_value_col,
-            )
-            if dashboard.empty:
-                self._show_error("No strategy rows available.")
-                return
+            self.run_btn.setEnabled(False)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(True)
+            self.status_label.setText("Starting calculations...")
 
-            budget_info = meta.get("budget_info", {})
-            basis_budget = float(budget_info.get("basis_budget", 0.0))
-            if basis_budget <= 0:
-                self._show_error("Budget basis resolved to 0. Configure people/custom budget.")
-                return
-
-            if objective == "win_probability":
-                opt = calculations.optimize_portfolio_by_win_probability(
-                    strategy_df=dashboard,
-                    budget=basis_budget,
-                    settings=tuned,
-                    cost_col=cost_col,
+            def do_work(progress_callback):
+                dashboard, meta, tuned = calculations.build_strategy_dashboard(
+                    hsx_df=cache_df,
+                    movies_df=movies_df,
+                    people_df=people_df,
+                    settings=run_settings,
+                    preset=preset,
+                    budget_mode=budget_mode,
+                    custom_budget=custom_budget,
                     risk_model=risk_model,
+                    integer_bid_mode=integer_mode,
+                    previous_bid=previous_bid,
+                    prob_bid_col=prob_bid_col,
+                    prob_value_col=prob_value_col,
                 )
-            else:
-                opt = calculations.optimize_portfolio(
-                    strategy_df=dashboard,
-                    budget=basis_budget,
-                    settings=tuned,
-                    cost_col=cost_col,
-                )
+                if dashboard.empty:
+                    raise ValueError("No strategy rows available.")
 
-            if opt.get("num_selected", 0) == 0 and cost_col == "market_fair_bid":
+                budget_info = meta.get("budget_info", {})
+                basis_budget = float(budget_info.get("basis_budget", 0.0))
+                if basis_budget <= 0:
+                    raise ValueError("Budget basis resolved to 0. Configure people/custom budget.")
+
                 if objective == "win_probability":
                     opt = calculations.optimize_portfolio_by_win_probability(
                         strategy_df=dashboard,
                         budget=basis_budget,
                         settings=tuned,
-                        cost_col="target_bid",
+                        cost_col=cost_col,
                         risk_model=risk_model,
+                        progress_callback=progress_callback,
                     )
                 else:
                     opt = calculations.optimize_portfolio(
                         strategy_df=dashboard,
                         budget=basis_budget,
                         settings=tuned,
-                        cost_col="target_bid",
+                        cost_col=cost_col,
+                        progress_callback=progress_callback,
                     )
-            eval_portfolio = opt.get("selected", pd.DataFrame()).copy()
-            eval_portfolio_label = "optimizer_selected"
-            eval_portfolio_meta: dict = {}
-            fixed_eval_fallback = False
-            if portfolio_eval_mode == "fixed_active_paid":
-                active_user = str(settings.get("strategy_user_name", "") or "").strip()
-                assigned_df = storage.get_assigned_movies_df()
-                fixed_df, fixed_meta = calculations.build_fixed_paid_portfolio(
-                    strategy_df=dashboard,
-                    assigned_df=assigned_df,
-                    active_user=active_user,
-                )
-                eval_portfolio_meta = fixed_meta
-                if not fixed_df.empty:
-                    eval_portfolio = fixed_df
-                    eval_portfolio_label = "fixed_active_paid"
-                else:
-                    fixed_eval_fallback = True
 
-            portfolio_win_eval = None
-            if not eval_portfolio.empty:
-                try:
-                    portfolio_win_eval = calculations.estimate_portfolio_win_probability(
+                if opt.get("num_selected", 0) == 0 and cost_col == "market_fair_bid":
+                    if objective == "win_probability":
+                        opt = calculations.optimize_portfolio_by_win_probability(
+                            strategy_df=dashboard,
+                            budget=basis_budget,
+                            settings=tuned,
+                            cost_col="target_bid",
+                            risk_model=risk_model,
+                            progress_callback=progress_callback,
+                        )
+                    else:
+                        opt = calculations.optimize_portfolio(
+                            strategy_df=dashboard,
+                            budget=basis_budget,
+                            settings=tuned,
+                            cost_col="target_bid",
+                            progress_callback=progress_callback,
+                        )
+                eval_portfolio = opt.get("selected", pd.DataFrame()).copy()
+                eval_portfolio_label = "optimizer_selected"
+                eval_portfolio_meta: dict = {}
+                fixed_eval_fallback = False
+                if portfolio_eval_mode == "fixed_active_paid":
+                    active_user = str(settings.get("strategy_user_name", "") or "").strip()
+                    assigned_df = storage.get_assigned_movies_df()
+                    fixed_df, fixed_meta = calculations.build_fixed_paid_portfolio(
                         strategy_df=dashboard,
-                        portfolio_df=eval_portfolio,
-                        budget=basis_budget,
-                        settings=tuned,
-                        risk_model=risk_model,
-                        cost_col=opt.get("cost_col", cost_col),
-                        portfolio_cost_col="optimizer_cost",
+                        assigned_df=assigned_df,
+                        active_user=active_user,
                     )
-                except Exception:
-                    portfolio_win_eval = None
+                    eval_portfolio_meta = fixed_meta
+                    if not fixed_df.empty:
+                        eval_portfolio = fixed_df
+                        eval_portfolio_label = "fixed_active_paid"
+                    else:
+                        fixed_eval_fallback = True
 
-            sim = calculations.simulate_portfolio_monte_carlo(
-                strategy_df=dashboard,
-                portfolio_df=eval_portfolio,
-                settings=tuned,
-                risk_model=risk_model,
-                cost_col="optimizer_cost",
-            )
+                portfolio_win_eval = None
+                if not eval_portfolio.empty:
+                    try:
+                        portfolio_win_eval = calculations.estimate_portfolio_win_probability(
+                            strategy_df=dashboard,
+                            portfolio_df=eval_portfolio,
+                            budget=basis_budget,
+                            settings=tuned,
+                            risk_model=risk_model,
+                            cost_col=opt.get("cost_col", cost_col),
+                            portfolio_cost_col="optimizer_cost",
+                            progress_callback=progress_callback,
+                        )
+                    except Exception:
+                        portfolio_win_eval = None
 
-            selected_tickers = set(opt.get("selected", pd.DataFrame()).get("ticker", pd.Series(dtype=object)).astype(str))
-            dashboard = dashboard.copy()
-            dashboard["optimizer_selected"] = dashboard["ticker"].astype(str).isin(selected_tickers)
-            avail = dashboard[dashboard["owner"].fillna("") == ""].copy()
-            avail = avail.sort_values(
-                ["priority_score", "prob_positive_edge", "adjusted_expected"],
-                ascending=[False, False, False],
-                na_position="last",
-            )
-
-            display_cols = [
-                "ticker", "current_price", "adjustment_multiplier", "adjusted_expected",
-                "target_bid_int" if integer_mode else "target_bid",
-                "target_market_bid_int" if integer_mode else "target_market_bid",
-                "max_bid_int" if integer_mode else "max_bid",
-                "risk_penalty", "prob_positive_edge", "prob_large_drawdown",
-                "deal_quality", "priority_score", "optimizer_selected",
-            ]
-            display_df = avail[[c for c in display_cols if c in avail.columns]].copy()
-            display_df = display_df.rename(columns={
-                "target_market_bid_int": "target_mkt_bid_int",
-                "target_market_bid": "target_mkt_bid",
-            })
-            self.dashboard_model.set_dataframe(display_df)
-            self._autosize_table_columns(self.dashboard_table)
-
-            selected = eval_portfolio.copy()
-            sel_cols = [c for c in ["ticker", "target_bid", "optimizer_cost", "adjusted_expected", "eff_per_dollar"] if c in selected.columns]
-            self.selected_model.set_dataframe(selected[sel_cols] if sel_cols else selected)
-            self._autosize_table_columns(self.selected_table)
-            if "adjusted_expected" in selected.columns and not selected.empty:
-                total_adj = pd.to_numeric(selected["adjusted_expected"], errors="coerce").sum()
-                self.selected_portfolio_summary.setText(f"Total AdjExp: {total_adj:.2f}")
-            else:
-                self.selected_portfolio_summary.setText("")
-
-            def _pct(value) -> str:
-                v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-                if pd.isna(v):
-                    return "N/A"
-                return f"{100.0 * float(v):.1f}%"
-
-            def _num(value, decimals: int = 2, default: str = "N/A") -> str:
-                v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-                if pd.isna(v):
-                    return default
-                return f"{float(v):.{decimals}f}"
-
-            selected_df = eval_portfolio.copy()
-            alternates_df = opt.get("alternates", pd.DataFrame()).copy()
-            if not selected_df.empty and "eff_per_dollar" not in selected_df.columns:
-                c = pd.to_numeric(selected_df.get("optimizer_cost", np.nan), errors="coerce")
-                a = pd.to_numeric(selected_df.get("adjusted_expected", np.nan), errors="coerce")
-                selected_df["eff_per_dollar"] = np.where(c > 0, a / c, np.nan)
-            if not alternates_df.empty and "eff_per_dollar" not in alternates_df.columns:
-                c = pd.to_numeric(alternates_df.get("optimizer_cost", np.nan), errors="coerce")
-                a = pd.to_numeric(alternates_df.get("adjusted_expected", np.nan), errors="coerce")
-                alternates_df["eff_per_dollar"] = np.where(c > 0, a / c, np.nan)
-            eval_meta = (
-                opt if (objective == "win_probability" and eval_portfolio_label == "optimizer_selected")
-                else (portfolio_win_eval if isinstance(portfolio_win_eval, dict) else (opt if objective == "win_probability" else {}))
-            )
-
-            text = [
-                "=== Draft Strategy Dashboard ===",
-                f"Preset: {meta.get('preset', 'balanced')} | Budget basis: {_fmt_money(basis_budget)} ({budget_info.get('budget_mode', 'personal')})",
-                f"Risk model: {risk_model} | Objective: {objective} | Integer bids: {'on' if integer_mode else 'off'}",
-                f"Seed mode: {run_seed_mode} | Seed used: {run_seed}",
-                f"Cost basis: {cost_col}",
-                f"Probability basis: bid={meta.get('prob_bid_col', 'target_bid')} | value={meta.get('prob_value_col', 'fair_budget_bid')}",
-                f"Evaluation portfolio: {eval_portfolio_label}",
-                f"Valuation controls: lambda={float(tuned.get('strategy_lambda', 0.35)):.2f} | clip=[{float(tuned.get('strategy_clip_low', 0.85)):.2f}, {float(tuned.get('strategy_clip_high', 1.15)):.2f}]",
-            ]
-            if eval_portfolio_label == "fixed_active_paid":
-                text.append(
-                    f"Fixed portfolio user={eval_portfolio_meta.get('active_user', '')} | "
-                    f"paid_rows={int(eval_portfolio_meta.get('rows_with_paid_price', 0))} | "
-                    f"with_metrics={int(eval_portfolio_meta.get('rows_with_metrics', 0))}"
+                sim = calculations.simulate_portfolio_monte_carlo(
+                    strategy_df=dashboard,
+                    portfolio_df=eval_portfolio,
+                    settings=tuned,
+                    risk_model=risk_model,
+                    cost_col="optimizer_cost",
+                    progress_callback=progress_callback,
                 )
-            elif fixed_eval_fallback:
-                text.append("Fixed paid portfolio requested but no eligible paid assignments found; using optimizer-selected portfolio.")
-            if integer_mode:
-                text.append(f"Integer bid rules: whole number, > {previous_bid}, <= remaining budget")
-                if previous_bid > 0:
-                    text.append("  [Note] Integer bid constraints are applied globally. Non-active movie recommendations are for comparative context only.")
-            mpf = pd.to_numeric(pd.Series([budget_info.get("market_pressure_factor", np.nan)]), errors="coerce").iloc[0]
-            if pd.notna(mpf):
-                text.append(f"Market pressure factor (league/personal): {float(mpf):.2f}")
+                
+                return {
+                    "opt": opt,
+                    "eval_portfolio": eval_portfolio,
+                    "eval_portfolio_label": eval_portfolio_label,
+                    "eval_portfolio_meta": eval_portfolio_meta,
+                    "portfolio_win_eval": portfolio_win_eval,
+                    "sim": sim,
+                    "dashboard": dashboard,
+                    "meta": meta,
+                    "tuned": tuned,
+                    "risk_model": risk_model,
+                    "objective": objective,
+                    "integer_mode": integer_mode,
+                    "previous_bid": previous_bid,
+                    "budget_info": budget_info,
+                    "basis_budget": basis_budget,
+                    "cost_col": cost_col,
+                    "run_seed": run_seed,
+                    "run_seed_mode": run_seed_mode,
+                    "fixed_eval_fallback": fixed_eval_fallback,
+                }
 
-            text.extend([
-                "",
-                "Optimizer summary:",
-                f"Selected: {opt.get('num_selected', 0)} movie(s) | Spend: {_fmt_money(opt.get('total_spend', 0.0))} / {_fmt_money(opt.get('budget', basis_budget))} | Left: {_fmt_money(opt.get('leftover', 0.0))}",
-                f"AdjExp total: {opt.get('total_adjusted_expected', 0.0):.2f}",
-                f"Per-film cap: {100.0 * float(opt.get('max_budget_pct_per_film', np.nan)):.1f}% of budget",
-            ])
-            if objective == "win_probability":
-                text.append(
-                    f"Estimated win probability: {_pct(opt.get('win_probability'))} "
-                    f"(vs {int(opt.get('opponent_count', 0))} simulated opponents)"
-                )
-            if isinstance(portfolio_win_eval, dict):
-                tag = "selected portfolio" if eval_portfolio_label == "optimizer_selected" else "fixed paid portfolio"
-                text.append(
-                    f"Estimated win probability ({tag}): {_pct(portfolio_win_eval.get('win_probability'))} "
-                    f"(vs {int(portfolio_win_eval.get('opponent_count', 0))} simulated opponents)"
-                )
-                spend = pd.to_numeric(pd.Series([portfolio_win_eval.get("selected_portfolio_spend", np.nan)]), errors="coerce").iloc[0]
-                feasible = pd.to_numeric(pd.Series([portfolio_win_eval.get("portfolio_budget_feasible", np.nan)]), errors="coerce").iloc[0]
-                if pd.notna(spend):
-                    text.append(
-                        f"Eval portfolio spend={_fmt_money(spend)} | "
-                        f"budget_feasible={'yes' if (pd.isna(feasible) or bool(feasible)) else 'no'}"
-                    )
-            qf = opt.get("quality_filter_info", {})
-            if isinstance(qf, dict) and qf.get("enabled"):
-                text.append(
-                    f"Quality filter: P(Edge)>={100.0 * float(qf.get('min_prob_positive_edge', 0.0)):.0f}% "
-                    f"and P(DD)<={100.0 * float(qf.get('max_prob_large_drawdown', 1.0)):.0f}% "
-                    f"(kept {qf.get('rows_after', 0)}/{qf.get('rows_before', 0)})"
-                )
-            else:
-                text.append("Quality filter: off")
-            if integer_mode:
-                drift = float(pd.to_numeric(dashboard.get("integer_rounding_drift", np.nan), errors="coerce").sum())
-                no_legal = int((pd.to_numeric(dashboard.get("can_bid_int", True), errors="coerce") == 0).sum())
-                text.append(f"Integer mode: total rounding drift={drift:+.2f}  no-legal-bid rows={no_legal}")
+            self.worker = DashboardWorker(do_work)
+            self.worker.progress.connect(self.on_dashboard_progress)
+            self.worker.finished.connect(self.on_dashboard_finished)
+            self.worker.error.connect(self.on_dashboard_error)
+            self.worker.start()
 
-            text.extend([
-                "",
-                "Selected portfolio (top picks):" if eval_portfolio_label == "optimizer_selected"
-                else "Evaluation portfolio (fixed paid):"
-            ])
-            if selected_df.empty:
-                text.append("None selected.")
-            else:
-                for _, row in selected_df.head(8).iterrows():
-                    text.append(
-                        f"{str(row.get('ticker', '')):<8}  "
-                        f"bid={_num(row.get('target_bid'))}  "
-                        f"cost={_num(row.get('optimizer_cost'))}  "
-                        f"adj={_num(row.get('adjusted_expected'))}  "
-                        f"eff/$={_num(row.get('eff_per_dollar'))}"
-                    )
-
-            text.extend(["", "Top alternates:"])
-            if alternates_df.empty:
-                text.append("No alternates available.")
-            else:
-                for _, row in alternates_df.head(5).iterrows():
-                    text.append(
-                        f"{str(row.get('ticker', '')):<8}  "
-                        f"bid={_num(row.get('target_bid'))}  "
-                        f"cost={_num(row.get('optimizer_cost'))}  "
-                        f"adj={_num(row.get('adjusted_expected'))}  "
-                        f"eff/$={_num(row.get('eff_per_dollar'))}"
-                    )
-
-            text.extend([
-                "",
-                "Model settings:",
-                f"Risk penalty coeffs: A={float(tuned.get('strategy_risk_a_vol', np.nan)):.2f}  "
-                f"B={float(tuned.get('strategy_risk_b_drawdown', np.nan)):.2f}  "
-                f"C={float(tuned.get('strategy_risk_c_release', np.nan)):.2f}  "
-                f"max={100.0 * float(tuned.get('strategy_risk_max_penalty', np.nan)):.1f}%  "
-                f"window={int(tuned.get('strategy_risk_release_window_days', 30))}d",
-                f"Portfolio penalties: div={float(tuned.get('strategy_diversification_penalty', 0.0)):.2f}  "
-                f"corr={float(tuned.get('strategy_correlation_penalty', 0.0)):.2f}",
-                f"Search mode={str(eval_meta.get('search_mode_used', tuned.get('strategy_search_mode', 'current_sampled')))}  "
-                f"candidates={int(pd.to_numeric(pd.Series([eval_meta.get('candidate_count_evaluated', 0)]), errors='coerce').fillna(0).iloc[0])}  "
-                f"runtime_ms={float(pd.to_numeric(pd.Series([eval_meta.get('search_runtime_ms', np.nan)]), errors='coerce').fillna(0.0).iloc[0]):.1f}",
-                f"Opponent profile={str(eval_meta.get('opponent_profile_used', tuned.get('strategy_opponent_profile', 'balanced_field')))}  "
-                f"bidup={float(tuned.get('strategy_opponent_bidup_strength', 0.0)):.2f}  "
-                f"cash_conserve={float(tuned.get('strategy_opponent_cash_conservation', 0.0)):.2f}",
-                "",
-                "Monte Carlo portfolio simulation:",
-                f"samples={sim.get('samples', 0)}  gross mean/p10/p50/p90="
-                f"{sim.get('gross_mean', 0.0):.2f} / {sim.get('gross_p10', 0.0):.2f} / "
-                f"{sim.get('gross_p50', 0.0):.2f} / {sim.get('gross_p90', 0.0):.2f}",
-                f"mc_seed={sim.get('seed_mode', run_seed_mode)}:{int(sim.get('seed_used', run_seed))}",
-                f"corr_mode requested/used={sim.get('corr_mode_requested', 'independent')}/{sim.get('corr_mode_used', 'independent')}  "
-                f"dim={int(sim.get('corr_effective_dim', 0))}  "
-                f"fallback={str(sim.get('corr_fallback_reason', '') or '-')}",
-                f"prob_samples={int(tuned.get('strategy_bootstrap_samples', 1000))}  "
-                f"opp_noise={float(tuned.get('strategy_mc_opponent_noise', 0.30)):.2f}  "
-                f"opp_aggr_sd={float(tuned.get('strategy_mc_aggression_sd', 0.10)):.2f}  "
-                f"conc_threshold={100.0 * float(tuned.get('strategy_mc_concentration_threshold', 0.40)):.1f}%",
-                f"exchange_rate={sim.get('exchange_rate_million_per_auction_dollar', np.nan):.4f} gross-units per $1 auction",
-                f"budget-equiv gross mean/p10/p50/p90="
-                f"{sim.get('gross_budget_equiv_mean', np.nan):.2f} / {sim.get('gross_budget_equiv_p10', np.nan):.2f} / "
-                f"{sim.get('gross_budget_equiv_p50', np.nan):.2f} / {sim.get('gross_budget_equiv_p90', np.nan):.2f}",
-                f"P(gross_equiv < spend)={_pct(sim.get('prob_gross_below_spend'))}  "
-                f"Concentration downside={_pct(sim.get('concentration_downside_prob'))}",
-            ])
-
-            # Practical recommendations from current run metrics.
-            recs = []
-            p_below = pd.to_numeric(pd.Series([sim.get("prob_gross_below_spend", np.nan)]), errors="coerce").iloc[0]
-            p_conc = pd.to_numeric(pd.Series([sim.get("concentration_downside_prob", np.nan)]), errors="coerce").iloc[0]
-            left = pd.to_numeric(pd.Series([opt.get("leftover", np.nan)]), errors="coerce").iloc[0]
-            win_p = np.nan
-            if eval_portfolio_label == "optimizer_selected" and objective == "win_probability":
-                win_p = pd.to_numeric(pd.Series([opt.get("win_probability", np.nan)]), errors="coerce").iloc[0]
-            elif isinstance(portfolio_win_eval, dict):
-                win_p = pd.to_numeric(pd.Series([portfolio_win_eval.get("win_probability", np.nan)]), errors="coerce").iloc[0]
-
-            if pd.notna(p_below):
-                if p_below > 0.20:
-                    recs.append("Portfolio downside is elevated. Tighten caps or increase quality filter strictness.")
-                elif p_below < 0.05:
-                    recs.append("Downside risk is controlled. You can consider modestly higher aggression if needed.")
-            if pd.notna(p_conc) and p_conc > 0.15:
-                recs.append("Concentration downside is high. Lower per-film cap or raise diversification/correlation penalties.")
-            if pd.notna(win_p):
-                if win_p < 0.20:
-                    recs.append("Win probability is low. For stress tests, consider higher market-fair cap (0.50-0.60) and fewer low-edge fillers.")
-                elif win_p > 0.40:
-                    recs.append("Win probability is competitive. Prioritize execution discipline at/under target bids.")
-            if pd.notna(left) and left > 0.15 * basis_budget:
-                recs.append("Large leftover budget detected. Check cap/filter settings; you may be leaving too much value unallocated.")
-            if isinstance(qf, dict) and not qf.get("enabled", False):
-                recs.append("Quality filter is off. Enabling it can reduce low-edge/high-drawdown filler picks.")
-            if not recs:
-                recs.append("Current setup is balanced. Validate robustness by running a few seeds and comparing top selections.")
-
-            text.extend(["", "Practical recommendations:"])
-            for rec in recs[:5]:
-                text.append(f"- {rec}")
-
-            diag = meta.get("diagnostics", {})
-            text.extend([
-                "",
-                "Diagnostics:",
-                f"rows={int(diag.get('rows', 0))}  missing_price={int(diag.get('missing_current_price', 0))}  "
-                f"missing_history={int(diag.get('missing_history', 0))}  missing_probs={int(diag.get('missing_probs', 0))}",
-            ])
-            validation = meta.get("validation", {})
-            stability = validation.get("ranking_stability", {})
-            if isinstance(stability, dict) and stability:
-                text.append(
-                    f"ranking_stability(top{int(stability.get('top_n', 10))} overlap mean/min/max): "
-                    f"{_pct(stability.get('mean_top_overlap'))} / {_pct(stability.get('min_top_overlap'))} / {_pct(stability.get('max_top_overlap'))}"
-                )
-            forward = validation.get("forward_check", {})
-            if isinstance(forward, dict) and forward:
-                ic = pd.to_numeric(pd.Series([forward.get("information_coefficient", np.nan)]), errors="coerce").iloc[0]
-                ic_txt = "N/A" if pd.isna(ic) else f"{float(ic):.3f}"
-                text.append(
-                    f"forward_check(h={int(forward.get('horizon_days', 0))}d, samples={int(forward.get('samples', 0))}): "
-                    f"dir_acc={_pct(forward.get('directional_accuracy'))}  IC={ic_txt}"
-                )
-
-            text.extend([
-                "",
-                "Glossary:",
-                "- adjusted_expected: risk-adjusted expectation from current price and history features",
-                "- target_bid / target_bid_int: recommended bid after risk penalty and budget share",
-                "- target_market_bid / target_market_bid_int: market-pressure scaled target (same risk logic, league-liquidity scale)",
-                "- prob_positive_edge: probability adjusted_expected exceeds bid threshold",
-                "- prob_large_drawdown: probability of large downside outcome from simulations",
-                "- market_value_ratio: adjusted_expected/current_price",
-                "- priority_score: blended ranking score used for selection",
-            ])
-            if cost_col == "current_price":
-                text.insert(4, "NOTE: current_price is diagnostic-only and not auction-dollar scaled.")
-            self.dashboard_summary.setPlainText("\n".join(text))
-            self._set_status("Dashboard updated.")
         except Exception as exc:
-            self._show_error("Failed to run dashboard.", detail=f"{exc}\n\n{traceback.format_exc()}")
+            self._show_error(f"Dashboard failed to start: {exc}")
+            self.run_btn.setEnabled(True)
+            self.progress_bar.setVisible(False) # Ensure progress bar is hidden on startup error
 
     # ---------- Draft State ----------
 
@@ -1755,6 +1596,310 @@ class DraftToolWindow(QtWidgets.QMainWindow):
         storage.save_people(people[people["name"].astype(str) != name].copy())
         self.refresh_all()
 
+    def _apply_dashboard_results(self, result: dict):
+        try:
+            opt = result["opt"]
+            eval_portfolio = result["eval_portfolio"]
+            eval_portfolio_label = result["eval_portfolio_label"]
+            eval_portfolio_meta = result["eval_portfolio_meta"]
+            portfolio_win_eval = result["portfolio_win_eval"]
+            sim = result["sim"]
+            dashboard = result["dashboard"]
+            meta = result["meta"]
+            tuned = result["tuned"]
+            risk_model = result["risk_model"]
+            objective = result["objective"]
+            integer_mode = result["integer_mode"]
+            previous_bid = result["previous_bid"]
+            budget_info = result["budget_info"]
+            basis_budget = result["basis_budget"]
+            cost_col = result["cost_col"]
+            run_seed = result["run_seed"]
+            run_seed_mode = result["run_seed_mode"]
+            fixed_eval_fallback = result["fixed_eval_fallback"]
+            selected_tickers = set(opt.get("selected", pd.DataFrame()).get("ticker", pd.Series(dtype=object)).astype(str))
+            dashboard = dashboard.copy()
+            dashboard["optimizer_selected"] = dashboard["ticker"].astype(str).isin(selected_tickers)
+            avail = dashboard[dashboard["owner"].fillna("") == ""].copy()
+            avail = avail.sort_values(
+                ["priority_score", "prob_positive_edge", "adjusted_expected"],
+                ascending=[False, False, False],
+                na_position="last",
+            )
+
+            display_cols = [
+                "ticker", "current_price", "adjustment_multiplier", "adjusted_expected",
+                "break_even_avail", "market_fair_bid",
+                "target_bid_int" if integer_mode else "target_bid",
+                "target_market_bid_int" if integer_mode else "target_market_bid",
+                "max_bid_int" if integer_mode else "max_bid",
+                "risk_penalty", "prob_positive_edge", "prob_large_drawdown",
+                "deal_quality", "priority_score", "optimizer_selected",
+            ]
+            display_df = avail[[c for c in display_cols if c in avail.columns]].copy()
+            display_df = display_df.rename(columns={
+                "target_market_bid_int": "target_mkt_bid_int",
+                "target_market_bid": "target_mkt_bid",
+            })
+            self.dashboard_model.set_dataframe(display_df)
+            self._autosize_table_columns(self.dashboard_table)
+
+            selected = eval_portfolio.copy()
+            sel_cols = [c for c in ["ticker", "target_bid", "optimizer_cost", "adjusted_expected", "eff_per_dollar"] if c in selected.columns]
+            self.selected_model.set_dataframe(selected[sel_cols] if sel_cols else selected)
+            self._autosize_table_columns(self.selected_table)
+            if "adjusted_expected" in selected.columns and not selected.empty:
+                total_adj = pd.to_numeric(selected["adjusted_expected"], errors="coerce").sum()
+                self.selected_portfolio_summary.setText(f"Total AdjExp: {total_adj:.2f}")
+            else:
+                self.selected_portfolio_summary.setText("")
+
+            def _pct(value) -> str:
+                v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+                if pd.isna(v):
+                    return "N/A"
+                return f"{100.0 * float(v):.1f}%"
+
+            def _num(value, decimals: int = 2, default: str = "N/A") -> str:
+                v = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+                if pd.isna(v):
+                    return default
+                return f"{float(v):.{decimals}f}"
+
+            selected_df = eval_portfolio.copy()
+            alternates_df = opt.get("alternates", pd.DataFrame()).copy()
+            if not selected_df.empty and "eff_per_dollar" not in selected_df.columns:
+                c = pd.to_numeric(selected_df.get("optimizer_cost", np.nan), errors="coerce")
+                a = pd.to_numeric(selected_df.get("adjusted_expected", np.nan), errors="coerce")
+                selected_df["eff_per_dollar"] = np.where(c > 0, a / c, np.nan)
+            if not alternates_df.empty and "eff_per_dollar" not in alternates_df.columns:
+                c = pd.to_numeric(alternates_df.get("optimizer_cost", np.nan), errors="coerce")
+                a = pd.to_numeric(alternates_df.get("adjusted_expected", np.nan), errors="coerce")
+                alternates_df["eff_per_dollar"] = np.where(c > 0, a / c, np.nan)
+            eval_meta = (
+                opt if (objective == "win_probability" and eval_portfolio_label == "optimizer_selected")
+                else (portfolio_win_eval if isinstance(portfolio_win_eval, dict) else (opt if objective == "win_probability" else {}))
+            )
+
+            text = [
+                "=== Draft Strategy Dashboard ===",
+                f"Preset: {meta.get('preset', 'balanced')} | Budget basis: {_fmt_money(basis_budget)} ({budget_info.get('budget_mode', 'personal')})",
+                f"Risk model: {risk_model} | Objective: {objective} | Integer bids: {'on' if integer_mode else 'off'}",
+                f"Seed mode: {run_seed_mode} | Seed used: {run_seed}",
+                f"Cost basis: {cost_col}",
+                f"Probability basis: bid={meta.get('prob_bid_col', 'target_bid')} | value={meta.get('prob_value_col', 'fair_budget_bid')}",
+                f"Evaluation portfolio: {eval_portfolio_label}",
+                f"Valuation controls: lambda={float(tuned.get('strategy_lambda', 0.35)):.2f} | clip=[{float(tuned.get('strategy_clip_low', 0.85)):.2f}, {float(tuned.get('strategy_clip_high', 1.15)):.2f}]",
+            ]
+            if eval_portfolio_label == "fixed_active_paid":
+                text.append(
+                    f"Fixed portfolio user={eval_portfolio_meta.get('active_user', '')} | "
+                    f"paid_rows={int(eval_portfolio_meta.get('rows_with_paid_price', 0))} | "
+                    f"with_metrics={int(eval_portfolio_meta.get('rows_with_metrics', 0))}"
+                )
+            elif fixed_eval_fallback:
+                text.append("Fixed paid portfolio requested but no eligible paid assignments found; using optimizer-selected portfolio.")
+            if integer_mode:
+                text.append(f"Integer bid rules: whole number, > {previous_bid}, <= remaining budget")
+                if previous_bid > 0:
+                    text.append("  [Note] Integer bid constraints are applied globally. Non-active movie recommendations are for comparative context only.")
+            mpf = pd.to_numeric(pd.Series([budget_info.get("market_pressure_factor", np.nan)]), errors="coerce").iloc[0]
+            if pd.notna(mpf):
+                text.append(f"Market pressure factor (league/personal): {float(mpf):.2f}")
+
+            text.extend([
+                "",
+                "Optimizer summary:",
+                f"Selected: {opt.get('num_selected', 0)} movie(s) | Spend: {_fmt_money(opt.get('total_spend', 0.0))} / {_fmt_money(opt.get('budget', basis_budget))} | Left: {_fmt_money(opt.get('leftover', 0.0))}",
+                f"AdjExp total: {opt.get('total_adjusted_expected', 0.0):.2f}",
+                f"Per-film cap: {100.0 * float(opt.get('max_budget_pct_per_film', np.nan)):.1f}% of budget",
+            ])
+            if objective == "win_probability":
+                opp_eff = int(opt.get('opponent_count', 0))
+                opp_req = int(opt.get('n_opp_requested', opp_eff))
+                text.append(
+                    f"Estimated win probability: {_pct(opt.get('win_probability'))} "
+                    f"(vs {opp_eff}/{opp_req} simulated opponents)"
+                )
+                wp = pd.to_numeric(pd.Series([opt.get('win_probability', np.nan)]), errors='coerce').iloc[0]
+                if pd.notna(wp) and wp >= 0.95 and opp_req > 0 and opp_eff < opp_req * 0.75:
+                    text.append(f"  [!] Win probability is based on only {opp_eff} of {opp_req} opponents with movies — pool may be depleted.")
+            if isinstance(portfolio_win_eval, dict):
+                tag = "selected portfolio" if eval_portfolio_label == "optimizer_selected" else "fixed paid portfolio"
+                eff2 = int(portfolio_win_eval.get('opponent_count', 0))
+                req2 = int(portfolio_win_eval.get('n_opp_requested', eff2))
+                text.append(
+                    f"Estimated win probability ({tag}): {_pct(portfolio_win_eval.get('win_probability'))} "
+                    f"(vs {eff2}/{req2} simulated opponents)"
+                )
+                wp2 = pd.to_numeric(pd.Series([portfolio_win_eval.get('win_probability', np.nan)]), errors='coerce').iloc[0]
+                if pd.notna(wp2) and wp2 >= 0.95 and req2 > 0 and eff2 < req2 * 0.75:
+                    text.append(f"  [!] Win probability is based on only {eff2} of {req2} opponents with movies — pool may be depleted.")
+                spend_val = pd.to_numeric(pd.Series([portfolio_win_eval.get("selected_portfolio_spend", np.nan)]), errors="coerce").iloc[0]
+                feasible_val = pd.to_numeric(pd.Series([portfolio_win_eval.get("portfolio_budget_feasible", np.nan)]), errors="coerce").iloc[0]
+                if pd.notna(spend_val):
+                    text.append(
+                        f"Eval portfolio spend={_fmt_money(spend_val)} | "
+                        f"budget_feasible={'yes' if (pd.isna(feasible_val) or bool(feasible_val)) else 'no'}"
+                    )
+            qf = opt.get("quality_filter_info", {})
+            if isinstance(qf, dict) and qf.get("enabled"):
+                text.append(
+                    f"Quality filter: P(Edge)>={100.0 * float(qf.get('min_prob_positive_edge', 0.0)):.0f}% "
+                    f"and P(DD)<={100.0 * float(qf.get('max_prob_large_drawdown', 1.0)):.0f}% "
+                    f"(kept {qf.get('rows_after', 0)}/{qf.get('rows_before', 0)})"
+                )
+            else:
+                text.append("Quality filter: off")
+            if integer_mode:
+                drift = float(pd.to_numeric(dashboard.get("integer_rounding_drift", np.nan), errors="coerce").sum())
+                no_legal = int((pd.to_numeric(dashboard.get("can_bid_int", True), errors="coerce") == 0).sum())
+                text.append(f"Integer mode: total rounding drift={drift:+.2f}  no-legal-bid rows={no_legal}")
+
+            text.extend([
+                "",
+                "Selected portfolio (top picks):" if eval_portfolio_label == "optimizer_selected"
+                else "Evaluation portfolio (fixed paid):"
+            ])
+            if selected_df.empty:
+                text.append("None selected.")
+            else:
+                for _, row in selected_df.head(8).iterrows():
+                    text.append(
+                        f"{str(row.get('ticker', '')):<8}  "
+                        f"bid={_num(row.get('target_bid'))}  "
+                        f"cost={_num(row.get('optimizer_cost'))}  "
+                        f"adj={_num(row.get('adjusted_expected'))}  "
+                        f"eff/$={_num(row.get('eff_per_dollar'))}"
+                    )
+
+            text.extend(["", "Top alternates:"])
+            if alternates_df.empty:
+                text.append("No alternates available.")
+            else:
+                for _, row in alternates_df.head(5).iterrows():
+                    text.append(
+                        f"{str(row.get('ticker', '')):<8}  "
+                        f"bid={_num(row.get('target_bid'))}  "
+                        f"cost={_num(row.get('optimizer_cost'))}  "
+                        f"adj={_num(row.get('adjusted_expected'))}  "
+                        f"eff/$={_num(row.get('eff_per_dollar'))}"
+                    )
+
+            text.extend([
+                "",
+                "Model settings:",
+                f"Risk penalty coeffs: A={float(tuned.get('strategy_risk_a_vol', np.nan)):.2f}  "
+                f"B={float(tuned.get('strategy_risk_b_drawdown', np.nan)):.2f}  "
+                f"C={float(tuned.get('strategy_risk_c_release', np.nan)):.2f}  "
+                f"max={100.0 * float(tuned.get('strategy_risk_max_penalty', np.nan)):.1f}%  "
+                f"window={int(tuned.get('strategy_risk_release_window_days', 30))}d",
+                f"Portfolio penalties: div={float(tuned.get('strategy_diversification_penalty', 0.0)):.2f}  "
+                f"corr={float(tuned.get('strategy_correlation_penalty', 0.0)):.2f}",
+                f"Search mode={str(eval_meta.get('search_mode_used', tuned.get('strategy_search_mode', 'current_sampled')))}  "
+                f"candidates={int(pd.to_numeric(pd.Series([eval_meta.get('candidate_count_evaluated', 0)]), errors='coerce').fillna(0).iloc[0])}  "
+                f"runtime_ms={float(pd.to_numeric(pd.Series([eval_meta.get('search_runtime_ms', np.nan)]), errors='coerce').fillna(0.0).iloc[0]):.1f}",
+                f"Opponent profile={str(eval_meta.get('opponent_profile_used', tuned.get('strategy_opponent_profile', 'balanced_field')))}  "
+                f"universes={int(eval_meta.get('opponent_universes', 1))}  "
+                f"bidup={float(tuned.get('strategy_opponent_bidup_strength', 0.0)):.2f}  "
+                f"cash_conserve={float(tuned.get('strategy_opponent_cash_conservation', 0.0)):.2f}",
+                "",
+                "Monte Carlo portfolio simulation:",
+                f"samples={sim.get('samples', 0)}  gross mean/p10/p50/p90="
+                f"{sim.get('gross_mean', 0.0):.2f} / {sim.get('gross_p10', 0.0):.2f} / "
+                f"{sim.get('gross_p50', 0.0):.2f} / {sim.get('gross_p90', 0.0):.2f}",
+                f"mc_seed={sim.get('seed_mode', run_seed_mode)}:{int(sim.get('seed_used', run_seed))}",
+                f"corr_mode requested/used={sim.get('corr_mode_requested', 'independent')}/{sim.get('corr_mode_used', 'independent')}  "
+                f"dim={int(sim.get('corr_effective_dim', 0))}  "
+                f"fallback={str(sim.get('corr_fallback_reason', '') or '-')}",
+                f"prob_samples={int(tuned.get('strategy_bootstrap_samples', 1000))}  "
+                f"opp_noise={float(tuned.get('strategy_mc_opponent_noise', 0.30)):.2f}  "
+                f"opp_aggr_sd={float(tuned.get('strategy_mc_aggression_sd', 0.10)):.2f}  "
+                f"conc_threshold={100.0 * float(tuned.get('strategy_mc_concentration_threshold', 0.40)):.1f}%",
+                f"exchange_rate={sim.get('exchange_rate_million_per_auction_dollar', np.nan):.4f} gross-units per $1 auction",
+                f"budget-equiv gross mean/p10/p50/p90="
+                f"{sim.get('gross_budget_equiv_mean', np.nan):.2f} / {sim.get('gross_budget_equiv_p10', np.nan):.2f} / "
+                f"{sim.get('gross_budget_equiv_p50', np.nan):.2f} / {sim.get('gross_budget_equiv_p90', np.nan):.2f}",
+                f"P(gross_equiv < spend)={_pct(sim.get('prob_gross_below_spend'))}  "
+                f"Concentration downside={_pct(sim.get('concentration_downside_prob'))}",
+            ])
+
+            # Practical recommendations from current run metrics.
+            recs = []
+            p_below = pd.to_numeric(pd.Series([sim.get("prob_gross_below_spend", np.nan)]), errors="coerce").iloc[0]
+            p_conc = pd.to_numeric(pd.Series([sim.get("concentration_downside_prob", np.nan)]), errors="coerce").iloc[0]
+            left = pd.to_numeric(pd.Series([opt.get("leftover", np.nan)]), errors="coerce").iloc[0]
+            win_p = np.nan
+            if eval_portfolio_label == "optimizer_selected" and objective == "win_probability":
+                win_p = pd.to_numeric(pd.Series([opt.get("win_probability", np.nan)]), errors="coerce").iloc[0]
+            elif isinstance(portfolio_win_eval, dict):
+                win_p = pd.to_numeric(pd.Series([portfolio_win_eval.get("win_probability", np.nan)]), errors="coerce").iloc[0]
+
+            if pd.notna(p_below):
+                if p_below > 0.20:
+                    recs.append("Portfolio downside is elevated. Tighten caps or increase quality filter strictness.")
+                elif p_below < 0.05:
+                    recs.append("Downside risk is controlled. You can consider modestly higher aggression if needed.")
+            if pd.notna(p_conc) and p_conc > 0.15:
+                recs.append("Concentration downside is high. Lower per-film cap or raise diversification/correlation penalties.")
+            if pd.notna(win_p):
+                if win_p < 0.20:
+                    recs.append("Win probability is low. For stress tests, consider higher market-fair cap (0.50-0.60) and fewer low-edge fillers.")
+                elif win_p > 0.40:
+                    recs.append("Win probability is competitive. Prioritize execution discipline at/under target bids.")
+            if pd.notna(left) and left > 0.15 * basis_budget:
+                recs.append("Large leftover budget detected. Check cap/filter settings; you may be leaving too much value unallocated.")
+            if isinstance(qf, dict) and not qf.get("enabled", False):
+                recs.append("Quality filter is off. Enabling it can reduce low-edge/high-drawdown filler picks.")
+            if not recs:
+                recs.append("Current setup is balanced. Validate robustness by running a few seeds and comparing top selections.")
+
+            text.extend(["", "Practical recommendations:"])
+            for rec in recs[:5]:
+                text.append(f"- {rec}")
+
+            diag = meta.get("diagnostics", {})
+            text.extend([
+                "",
+                "Diagnostics:",
+                f"rows={int(diag.get('rows', 0))}  missing_price={int(diag.get('missing_current_price', 0))}  "
+                f"missing_history={int(diag.get('missing_history', 0))}  missing_probs={int(diag.get('missing_probs', 0))}",
+            ])
+
+            validation = meta.get("validation", {})
+            stability = validation.get("ranking_stability", {})
+            if isinstance(stability, dict) and stability:
+                text.append(
+                    f"ranking_stability(top{int(stability.get('top_n', 10))} overlap mean/min/max): "
+                    f"{_pct(stability.get('mean_top_overlap'))} / {_pct(stability.get('min_top_overlap'))} / {_pct(stability.get('max_top_overlap'))}"
+                )
+            forward = validation.get("forward_check", {})
+            if isinstance(forward, dict) and forward:
+                ic = pd.to_numeric(pd.Series([forward.get("information_coefficient", np.nan)]), errors="coerce").iloc[0]
+                ic_txt = "N/A" if pd.isna(ic) else f"{float(ic):.3f}"
+                text.append(
+                    f"forward_check(h={int(forward.get('horizon_days', 0))}d, samples={int(forward.get('samples', 0))}): "
+                    f"dir_acc={_pct(forward.get('directional_accuracy'))}  IC={ic_txt}"
+                )
+
+            text.extend([
+                "",
+                "Glossary:",
+                "- adjusted_expected: risk-adjusted expectation from current price and history features",
+                "- target_bid / target_bid_int: recommended bid after risk penalty and budget share",
+                "- target_market_bid / target_market_bid_int: market-pressure scaled target (same risk logic, league-liquidity scale)",
+                "- prob_positive_edge: probability adjusted_expected exceeds bid threshold",
+                "- prob_large_drawdown: probability of large downside outcome from simulations",
+                "- market_value_ratio: adjusted_expected/current_price",
+                "- priority_score: blended ranking score used for selection",
+            ])
+            if cost_col == "current_price":
+                # Find index after Model settings: or somewhere reasonable
+                text.insert(6, "NOTE: current_price is diagnostic-only and not auction-dollar scaled.")
+            self.dashboard_summary.setPlainText("\n".join(text))
+            self._set_status("Dashboard updated.")
+        except Exception as exc:
+            self._show_error(f"Error applying results: {exc}")
 
 def run_gui() -> int:
     app = QtWidgets.QApplication.instance()

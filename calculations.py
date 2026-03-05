@@ -900,6 +900,16 @@ def add_bid_guidance(
     out['value_ratio'] = bid_edge_ratio
     out['market_pressure_factor'] = budgets.get('market_pressure_factor', np.nan)
 
+    # Break-even bid based on raw HSX price share of the available pool.
+    # This is the price-proportional anchor (vs market_fair_bid which uses adjusted_expected shares).
+    raw_price = pd.to_numeric(out.get('current_price', np.nan), errors='coerce')
+    avail_price_total = float(raw_price.where(avail_mask).clip(lower=0.0).sum())
+    if avail_price_total > 0 and league_budget > 0:
+        price_share = raw_price.where(avail_mask).clip(lower=0.0) / avail_price_total
+        out['break_even_avail'] = (price_share * league_budget).where(avail_mask, np.nan)
+    else:
+        out['break_even_avail'] = np.nan
+
     return out, budgets
 
 
@@ -1061,6 +1071,7 @@ def optimize_portfolio(
     budget: float,
     settings: dict | None = None,
     cost_col: str = 'target_bid',
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict:
     """
     Phase 1 / Step 6:
@@ -1237,6 +1248,7 @@ def _build_return_scenarios(
     risk_model: str = 'bootstrap',
     samples: int | None = None,
     random_seed: int | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> tuple[dict[str, np.ndarray], int, str, dict]:
     if history_loader is None:
         import storage
@@ -1252,6 +1264,11 @@ def _build_return_scenarios(
     min_h = max(int(settings.get('strategy_min_horizon_days', 7)), 1)
     max_h = max(int(settings.get('strategy_max_horizon_days', 30)), min_h)
     default_h = max(int(settings.get('strategy_default_horizon_days', 14)), min_h)
+    # Minimum return volatility floor: pre-release HSX prices are stable (~1-2% std),
+    # but actual box office uncertainty is far higher. This floor prevents the MC from
+    # collapsing to a near-deterministic comparison when history shows very low variance.
+    # Set to 0 to disable. Default 0.15 ≈ 40% annualized uncertainty for a 14-day window.
+    min_return_vol = float(np.clip(settings.get('strategy_min_return_volatility', 0.15), 0.0, 1.0))
 
     scenarios: dict[str, np.ndarray] = {}
     ticker_order: list[str] = []
@@ -1260,6 +1277,10 @@ def _build_return_scenarios(
         ticker = str(row.get('ticker', '')).upper()
         if not ticker:
             continue
+
+        if progress_callback and (row_num % 5 == 0 or row_num == len(strategy_df) - 1):
+            pct = (row_num / len(strategy_df)) * 90.0 
+            progress_callback(pct, f"Scenarios: {ticker} ({row_num+1}/{len(strategy_df)})")
 
         raw_days = pd.to_numeric(pd.Series([row.get('scenario_horizon_days', row.get('days_to_release'))]), errors='coerce').iloc[0]
         if pd.isna(raw_days):
@@ -1279,6 +1300,11 @@ def _build_return_scenarios(
             rng=rng,
             risk_model=risk_model,
         )
+        if min_return_vol > 0:
+            hist_std = float(np.std(draws)) if draws.size > 1 else 0.0
+            if hist_std < min_return_vol:
+                extra_sd = float(np.sqrt(max(min_return_vol ** 2 - hist_std ** 2, 0.0)))
+                draws = np.clip(draws + rng.normal(0.0, extra_sd, size=n_sims), -0.95, 5.0)
         scenarios[ticker] = draws
         ticker_order.append(ticker)
         marginal_cols.append(draws.astype(float))
@@ -1349,6 +1375,7 @@ def simulate_portfolio_monte_carlo(
     history_loader: Callable[[str], pd.DataFrame | None] | None = None,
     risk_model: str = 'bootstrap',
     cost_col: str = 'optimizer_cost',
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict:
     """
     Phase 2 / B:
@@ -1398,6 +1425,7 @@ def simulate_portfolio_monte_carlo(
         settings=settings,
         history_loader=history_loader,
         risk_model=risk_model,
+        progress_callback=progress_callback, # Pass callback
     )
 
     mc_samples = max(int(settings.get('strategy_mc_samples', 1500)), 100)
@@ -1407,21 +1435,52 @@ def simulate_portfolio_monte_carlo(
     strategy_map['ticker'] = strategy_map['ticker'].astype(str).str.upper()
     strategy_map = strategy_map.set_index('ticker')
     tickers = portfolio_df['ticker'].astype(str).str.upper().tolist()
-    contrib_rows = []
-    total = np.zeros(mc_samples, dtype=float)
-    spend = 0.0
 
+    # Prepare row_vals for efficient access
+    row_vals = {}
     for ticker in tickers:
         if ticker not in strategy_map.index:
             continue
         adj = float(pd.to_numeric(pd.Series([strategy_map.at[ticker, 'adjusted_expected']]), errors='coerce').iloc[0] or 0.0)
-        if adj <= 0:
-            continue
-        draws = scenarios.get(ticker, np.zeros(mc_samples, dtype=float))
-        gross = np.maximum(0.0, adj * (1.0 + draws))
-        contrib_rows.append(gross)
-        total += gross
+        if adj > 0:
+            row_vals[ticker] = adj
 
+    # Run MC samples.
+    # To support progress updates for a single matrix-multiply, we split into chunks.
+    chunk_size = 1000
+    n_chunks = (mc_samples + chunk_size - 1) // chunk_size
+    all_gross = []
+    all_top_share = []
+    
+    for i in range(n_chunks):
+        if progress_callback:
+            pct = 50.0 + (i / n_chunks) * 50.0  # Start from 50% after scenario building
+            progress_callback(pct, f"MC Simulation: Chunk {i+1}/{n_chunks}")
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, mc_samples)
+        
+        chunk_scenarios = {k: v[start:end] for k, v in scenarios.items()}
+        chunk_adj_gross = np.zeros(end - start, dtype=float)
+        chunk_max_gross = np.zeros(end - start, dtype=float)
+        
+        for t, adj in row_vals.items():
+            draws = chunk_scenarios.get(t, np.zeros(end - start, dtype=float))
+            gross_t = adj * (1.0 + draws)
+            chunk_adj_gross += gross_t
+            chunk_max_gross = np.maximum(chunk_max_gross, gross_t)
+        
+        # Clip to 0 after summing
+        chunk_adj_gross_clipped = np.maximum(0.0, chunk_adj_gross)
+        all_gross.append(chunk_adj_gross_clipped)
+        
+        # Calculate share for concentration metric
+        share_u = np.where(chunk_adj_gross_clipped > 0, chunk_max_gross / chunk_adj_gross_clipped, 0.0)
+        all_top_share.append(share_u)
+
+    portfolio_gross = np.concatenate(all_gross)
+    top_share = np.concatenate(all_top_share)
+
+    spend = 0.0
     if cost_col in portfolio_df.columns:
         spend = float(pd.to_numeric(portfolio_df[cost_col], errors='coerce').sum())
     elif 'optimizer_cost' in portfolio_df.columns:
@@ -1429,7 +1488,7 @@ def simulate_portfolio_monte_carlo(
     elif 'target_bid' in portfolio_df.columns:
         spend = float(pd.to_numeric(portfolio_df['target_bid'], errors='coerce').sum())
 
-    if not contrib_rows:
+    if not row_vals: # Check if any valid movies were added to row_vals
         return {
             'samples': mc_samples,
             'gross_mean': 0.0,
@@ -1452,12 +1511,14 @@ def simulate_portfolio_monte_carlo(
             'corr_fallback_reason': corr_meta.get('corr_fallback_reason', ''),
         }
 
-    contrib = np.vstack(contrib_rows)
-    top_share = np.where(total > 0, contrib.max(axis=0) / total, 0.0)
+    total = portfolio_gross 
+    threshold = float(settings.get('strategy_mc_concentration_threshold', 0.40))
+    concentration_downside_prob = np.nan
+
     if pd.notna(exchange_rate) and exchange_rate > 0:
         total_budget_equiv = total / float(exchange_rate)
         downside_mask = total_budget_equiv < spend
-        conc_downside = float(np.mean(downside_mask & (top_share > threshold)))
+        concentration_downside_prob = float(np.mean(downside_mask & (top_share > threshold)))
         prob_below_spend = float(np.mean(downside_mask)) if spend > 0 else 0.0
         budget_equiv_mean = float(np.mean(total_budget_equiv))
         budget_equiv_p10 = float(np.percentile(total_budget_equiv, 10))
@@ -1465,7 +1526,7 @@ def simulate_portfolio_monte_carlo(
         budget_equiv_p90 = float(np.percentile(total_budget_equiv, 90))
     else:
         total_budget_equiv = np.full_like(total, np.nan, dtype=float)
-        conc_downside = np.nan
+        # conc_downside = np.nan # Removed
         prob_below_spend = np.nan if spend > 0 else 0.0
         budget_equiv_mean = np.nan
         budget_equiv_p10 = np.nan
@@ -1502,7 +1563,7 @@ def simulate_portfolio_monte_carlo(
         'gross_p50': float(np.percentile(total, 50)),
         'gross_p90': float(np.percentile(total, 90)),
         'prob_gross_below_spend': prob_below_spend,
-        'concentration_downside_prob': conc_downside,
+        'concentration_downside_prob': concentration_downside_prob,
         'aggression_sensitivity': pd.DataFrame(agg_rows),
         'exchange_rate_million_per_auction_dollar': exchange_rate,
         'gross_budget_equiv_mean': budget_equiv_mean,
@@ -1615,6 +1676,55 @@ def _resolve_opponent_profile_params(settings: dict) -> dict:
     }
 
 
+def _build_exclusive_opponent_sets(
+    strategy_df: pd.DataFrame,
+    excluded_tickers: frozenset,
+    n_opp: int,
+    rng: np.random.Generator,
+    cost_col: str,
+    max_pct: float,
+    budget: float,
+    opp_params: dict,
+    integer_mode: bool,
+    min_legal: int,
+    integer_cap: int,
+) -> list[list[str]]:
+    """
+    Generate n_opp mutually exclusive opponent portfolios from a shrinking pool.
+
+    Each opponent picks from the movies not yet taken by Taylor (excluded_tickers)
+    or any previously constructed opponent. This guarantees that every movie
+    appears in at most one portfolio across all players in the simulation.
+    """
+    taken = set(excluded_tickers)
+    opponent_portfolios: list[list[str]] = []
+    for _ in range(n_opp):
+        avail_df = strategy_df[
+            ~strategy_df['ticker'].astype(str).str.upper().isin(taken)
+        ].copy()
+        if avail_df.empty:
+            break
+        aggr = max(0.6, rng.normal(1.0, opp_params['aggr_sd']))
+        ticks = _random_greedy_tickers(
+            strategy_df=avail_df,
+            budget=budget,
+            cost_col=cost_col,
+            max_pct=max_pct,
+            rng=rng,
+            score_noise=opp_params['noise_sigma'],
+            aggression=aggr,
+            integer_mode=integer_mode,
+            min_legal_bid=min_legal,
+            integer_cap=integer_cap,
+            bidup_strength=opp_params['bidup_strength'],
+            cash_conservation=opp_params['cash_conservation'],
+        )
+        if ticks:
+            opponent_portfolios.append(ticks)
+            taken.update(str(t).upper() for t in ticks)
+    return opponent_portfolios
+
+
 def _resolve_search_mode(settings: dict) -> str:
     mode = str(settings.get('strategy_search_mode', 'current_sampled') or 'current_sampled').strip().lower()
     allowed = {'current_sampled', 'random_multistart', 'local_search', 'genetic'}
@@ -1673,6 +1783,7 @@ def _genetic_candidate_sets(
     elite_frac: float,
     mutation_rate: float,
     target_sets: int,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> list[list[str]]:
     universe = list(cost_map.keys())
     if not universe:
@@ -1734,7 +1845,10 @@ def _genetic_candidate_sets(
         if s:
             population.append(s)
 
-    for _ in range(gens):
+    for gen_num in range(gens):
+        if progress_callback:
+            pct = (gen_num / gens) * 100.0
+            progress_callback(pct, f"Genetic Search: Generation {gen_num+1}/{gens}")
         scored = sorted(population, key=_fitness, reverse=True)
         elites = scored[:elite_n]
         new_pop = [set(e) for e in elites]
@@ -1763,6 +1877,8 @@ def _genetic_candidate_sets(
             if child:
                 new_pop.append(child)
         population = new_pop
+    if progress_callback:
+        progress_callback(100.0, "Genetic Search: Complete")
 
     final_scored = sorted(population, key=_fitness, reverse=True)
     out: list[list[str]] = []
@@ -1784,6 +1900,7 @@ def optimize_portfolio_by_win_probability(
     history_loader: Callable[[str], pd.DataFrame | None] | None = None,
     risk_model: str = 'bootstrap',
     cost_col: str = 'current_price',
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict:
     """
     Phase 2 / C:
@@ -1791,7 +1908,7 @@ def optimize_portfolio_by_win_probability(
     """
     settings = settings or {}
     if budget <= 0 or strategy_df.empty:
-        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col)
+        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col, progress_callback=progress_callback)
         base.update({
             'objective': 'win_probability',
             'win_probability': np.nan,
@@ -1800,7 +1917,7 @@ def optimize_portfolio_by_win_probability(
         return base
 
     # Base deterministic portfolio included as a candidate.
-    deterministic = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col)
+    deterministic = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col, progress_callback=progress_callback)
     max_pct = _resolve_per_film_cap_pct(settings, cost_col)
     search_mode = _resolve_search_mode(settings)
     candidate_count = max(
@@ -1821,7 +1938,7 @@ def optimize_portfolio_by_win_probability(
     min_legal = prev_bid + 1
     personal_cap = pd.to_numeric(pd.Series([settings.get('strategy_personal_budget_cap', np.nan)]), errors='coerce').iloc[0]
     if integer_mode and (pd.isna(personal_cap) or personal_cap <= 0):
-        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col)
+        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col, progress_callback=progress_callback)
         base.update({
             'objective': 'win_probability',
             'win_probability': np.nan,
@@ -1856,7 +1973,7 @@ def optimize_portfolio_by_win_probability(
         per_film_cap = min(per_film_cap, float(integer_cap))
     cost_df = cost_df[cost_df['optimizer_cost'] <= per_film_cap].copy()
     if cost_df.empty:
-        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col)
+        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col, progress_callback=progress_callback)
         base.update({
             'objective': 'win_probability',
             'win_probability': np.nan,
@@ -1894,6 +2011,8 @@ def optimize_portfolio_by_win_probability(
 
     attempts = 0
     attempt_mult = 6 if search_mode == 'current_sampled' else 10
+    if progress_callback:
+        progress_callback(10.0, "Generating initial candidate portfolios...")
     while len(candidate_sets) < candidate_count and attempts < candidate_count * attempt_mult:
         attempts += 1
         aggr = max(0.6, rng.normal(1.0, aggr_sd))
@@ -1916,15 +2035,24 @@ def optimize_portfolio_by_win_probability(
         key = tuple(sorted(set(ticks)))
         if key and _is_budget_feasible(list(key)):
             candidate_sets[key] = list(key)
+    if progress_callback:
+        progress_callback(20.0, f"Generated {len(candidate_sets)} initial candidates.")
 
     # Optional local refinement layer.
     if search_mode == 'local_search' and candidate_sets:
+        if progress_callback:
+            progress_callback(25.0, "Performing local search refinement...")
         local_iters = max(int(settings.get('strategy_search_local_iters', 25)), 0)
         value_map = dict(zip(
             cost_df['ticker'].astype(str).str.upper().tolist(),
             pd.to_numeric(cost_df['adjusted_expected'], errors='coerce').fillna(0.0).tolist(),
         ))
-        for ticks in list(candidate_sets.values()):
+        initial_candidate_keys = list(candidate_sets.keys())
+        for i, key in enumerate(initial_candidate_keys):
+            if progress_callback:
+                pct = 25.0 + (i / len(initial_candidate_keys)) * 10.0
+                progress_callback(pct, f"Local Search: Refining candidate {i+1}/{len(initial_candidate_keys)}")
+            ticks = candidate_sets[key]
             refined = _local_search_refine(
                 ticks=ticks,
                 cost_map=cost_map,
@@ -1932,12 +2060,16 @@ def optimize_portfolio_by_win_probability(
                 budget=float(budget),
                 iterations=local_iters,
             )
-            key = tuple(sorted(set(refined)))
-            if key and _is_budget_feasible(list(key)):
-                candidate_sets[key] = list(key)
+            new_key = tuple(sorted(set(refined)))
+            if new_key and _is_budget_feasible(list(new_key)):
+                candidate_sets[new_key] = list(new_key)
+        if progress_callback:
+            progress_callback(35.0, "Local search complete.")
 
     # Optional genetic search augmentation.
     if search_mode == 'genetic' and candidate_sets:
+        if progress_callback:
+            progress_callback(35.0, "Performing genetic search augmentation...")
         value_map = dict(zip(
             cost_df['ticker'].astype(str).str.upper().tolist(),
             pd.to_numeric(cost_df['adjusted_expected'], errors='coerce').fillna(0.0).tolist(),
@@ -1953,14 +2085,17 @@ def optimize_portfolio_by_win_probability(
             elite_frac=float(np.clip(settings.get('strategy_search_elite_frac', 0.20), 0.05, 0.90)),
             mutation_rate=float(np.clip(settings.get('strategy_search_mutation_rate', 0.08), 0.0, 0.80)),
             target_sets=max(candidate_count, 20),
+            progress_callback=lambda p, msg: progress_callback(35.0 + p * 0.15, f"Genetic Search: {msg}") if progress_callback else None,
         )
         for ticks in ga_candidates:
             key = tuple(sorted(set(ticks)))
             if key and _is_budget_feasible(list(key)):
                 candidate_sets[key] = list(key)
+        if progress_callback:
+            progress_callback(50.0, "Genetic search complete.")
 
     if not candidate_sets:
-        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col)
+        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col, progress_callback=progress_callback)
         base.update({
             'objective': 'win_probability',
             'win_probability': np.nan,
@@ -1969,45 +2104,7 @@ def optimize_portfolio_by_win_probability(
         })
         return base
 
-    # Opponent portfolios: include strongest candidate portfolios first, then random fill.
     strategy_map = strategy_df.set_index('ticker')
-
-    def _static_expected(ticks: list[str]) -> float:
-        total = 0.0
-        for t in ticks:
-            if t in strategy_map.index:
-                total += float(pd.to_numeric(pd.Series([strategy_map.at[t, 'adjusted_expected']]), errors='coerce').iloc[0] or 0.0)
-        return total
-
-    sorted_candidates = sorted(candidate_sets.values(), key=_static_expected, reverse=True)
-    opponent_sets = [c for c in sorted_candidates[:n_opp] if c]
-
-    opp_attempts = 0
-    while len(opponent_sets) < n_opp and opp_attempts < n_opp * 8:
-        opp_attempts += 1
-        aggr = max(0.6, rng.normal(1.0, aggr_sd))
-        ticks = _random_greedy_tickers(
-            strategy_df=strategy_df,
-            budget=budget,
-            cost_col=cost_col,
-            max_pct=max_pct,
-            rng=rng,
-            score_noise=noise_sigma,
-            aggression=aggr,
-            integer_mode=integer_mode,
-            min_legal_bid=min_legal,
-            integer_cap=integer_cap,
-            bidup_strength=opp_params['bidup_strength'],
-            cash_conservation=opp_params['cash_conservation'],
-        )
-        if ticks:
-            k = sorted(set(ticks))
-            if _is_budget_feasible(k):
-                opponent_sets.append(k)
-    if not opponent_sets and deterministic['selected'].empty is False:
-        det = sorted(deterministic['selected']['ticker'].astype(str).str.upper().tolist())
-        if _is_budget_feasible(det):
-            opponent_sets.append(det)
 
     scenarios, _, _, _ = _build_return_scenarios(
         strategy_df=strategy_df,
@@ -2016,44 +2113,103 @@ def optimize_portfolio_by_win_probability(
         risk_model=risk_model,
         samples=sims,
         random_seed=seed,
+        progress_callback=lambda p, msg: progress_callback(50.0 + p * 0.10, f"Building Scenarios: {msg}") if progress_callback else None,
     )
-    def portfolio_gross(tickers: list[str]) -> np.ndarray:
-        g = np.zeros(sims, dtype=float)
-        for t in tickers:
-            if t not in strategy_map.index:
-                continue
-            adj = float(pd.to_numeric(pd.Series([strategy_map.at[t, 'adjusted_expected']]), errors='coerce').iloc[0] or 0.0)
-            draws = scenarios.get(t, np.zeros(sims, dtype=float))
-            g += np.maximum(0.0, adj * (1.0 + draws))
-        return g
+    # Precompute per-movie gross arrays for fast portfolio evaluation.
+    per_movie_gross: dict[str, np.ndarray] = {}
+    for t in list(strategy_map.index):
+        t_upper = str(t).upper()
+        adj = float(pd.to_numeric(pd.Series([strategy_map.at[t, 'adjusted_expected']]), errors='coerce').iloc[0] or 0.0)
+        draws = scenarios.get(t, np.zeros(sims, dtype=float))
+        per_movie_gross[t_upper] = np.maximum(0.0, adj * (1.0 + draws))
 
-    opp_gross = [portfolio_gross(ticks) for ticks in opponent_sets]
-    opp_max = np.maximum.reduce(opp_gross) if opp_gross else np.zeros(sims, dtype=float)
+    def _gross_from_cache(tickers: list[str]) -> np.ndarray:
+        arrays = [per_movie_gross[str(t).upper()] for t in tickers if str(t).upper() in per_movie_gross]
+        return np.sum(arrays, axis=0).astype(float) if arrays else np.zeros(sims, dtype=float)
 
+    n_univ = max(int(settings.get('strategy_mc_opponent_universes', 25)), 1)
+    total_steps = len(candidate_sets) * n_univ
+    current_step = 0
+
+    # Evaluate each candidate portfolio against globally exclusive opponent sets.
     best = None
-    for ticks in candidate_sets.values():
-        gross = portfolio_gross(ticks)
-        wins = gross > (opp_max + 1e-9)
-        ties = np.abs(gross - opp_max) <= 1e-9
-        win_prob = float(np.mean(wins.astype(float) + 0.5 * ties.astype(float)))
+    for cand_idx, ticks in enumerate(candidate_sets.values()):
+        ticks_upper = frozenset(str(t).upper() for t in ticks)
+        gross = _gross_from_cache(list(ticks_upper))
+
+        cand_univ_win_probs = []
+        cand_univ_opp_counts = []
+
+        for u_idx in range(n_univ):
+            current_step += 1
+            if progress_callback:
+                pct = 60.0 + (current_step / total_steps) * 40.0
+                progress_callback(pct, f"Optimizing: Evaluating candidate {cand_idx+1}/{len(candidate_sets)}, universe {u_idx+1}/{n_univ}")
+
+            # Consistent seed for this universe across all candidates
+            # so they face the same baseline opponent scenarios.
+            u_rng = np.random.default_rng([seed, 1000 + u_idx])
+
+            opp_sets = _build_exclusive_opponent_sets(
+                strategy_df=strategy_df,
+                excluded_tickers=ticks_upper,
+                n_opp=n_opp,
+                rng=u_rng,
+                cost_col=cost_col,
+                max_pct=max_pct,
+                budget=budget,
+                opp_params=opp_params,
+                integer_mode=integer_mode,
+                min_legal=1,
+                integer_cap=integer_cap,
+            )
+
+            if not opp_sets:
+                cand_univ_win_probs.append(1.0)
+                cand_univ_opp_counts.append(0)
+                continue
+
+            opp_gross_list = [_gross_from_cache(o) for o in opp_sets]
+            excl_opp_max = np.maximum.reduce(opp_gross_list)
+
+            wins = gross > (excl_opp_max + 1e-9)
+            ties = np.abs(gross - excl_opp_max) <= 1e-9
+            win_prob_u = float(np.mean(wins.astype(float) + 0.5 * ties.astype(float)))
+
+            cand_univ_win_probs.append(win_prob_u)
+            cand_univ_opp_counts.append(len(opp_sets))
+
+        avg_wp = float(np.mean(cand_univ_win_probs))
+        win_prob = avg_wp
         exp_gross = float(np.mean(gross))
         key = (win_prob, exp_gross)
+
         if best is None or key > best['key']:
-            best = {'ticks': ticks, 'gross': gross, 'win_prob': win_prob, 'exp_gross': exp_gross, 'key': key}
+            best = {
+                'ticks': list(ticks),
+                'gross': gross,
+                'win_prob': win_prob,
+                'exp_gross': exp_gross,
+                'key': key,
+                'opp_count': float(np.mean(cand_univ_opp_counts)),
+                'opponent_universes': n_univ,
+            }
+    if progress_callback:
+        progress_callback(100.0, "Optimization complete.")
 
     if best is None:
-        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col)
+        base = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col, progress_callback=progress_callback)
         base.update({
             'objective': 'win_probability',
             'win_probability': np.nan,
-            'opponent_count': len(opponent_sets),
+            'opponent_count': n_opp,
             'quality_filter_info': quality_info,
         })
         return base
 
     selected = cost_df[cost_df['ticker'].astype(str).str.upper().isin(best['ticks'])].copy()
     alternates = cost_df[~cost_df['ticker'].astype(str).str.upper().isin(best['ticks'])].copy()
-    alternates = alternates.sort_values('priority_score', ascending=False).head(10)
+    alternates = alternates.sort_values('eff_per_dollar', ascending=False).head(10)
     total_spend = float(pd.to_numeric(selected['optimizer_cost'], errors='coerce').sum())
     total_adj = float(pd.to_numeric(selected['adjusted_expected'], errors='coerce').sum())
 
@@ -2070,7 +2226,9 @@ def optimize_portfolio_by_win_probability(
         'cost_col': cost_col,
         'objective': 'win_probability',
         'win_probability': best['win_prob'],
-        'opponent_count': int(len(opponent_sets)),
+        'opponent_count': int(round(best.get('opp_count', n_opp))),
+        'n_opp_requested': int(n_opp),
+        'opponent_universes': int(best.get('opponent_universes', 1)),
         'expected_gross_mc': best['exp_gross'],
         'quality_filter_info': quality_info,
         'seed_mode': seed_mode,
@@ -2092,6 +2250,7 @@ def estimate_portfolio_win_probability(
     risk_model: str = 'bootstrap',
     cost_col: str = 'current_price',
     portfolio_cost_col: str = 'optimizer_cost',
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict:
     """
     Estimate win probability for a *given* portfolio against simulated opponents.
@@ -2115,15 +2274,7 @@ def estimate_portfolio_win_probability(
         }
 
     max_pct = _resolve_per_film_cap_pct(settings, cost_col)
-    candidate_count = max(
-        int(settings.get('strategy_search_candidates', settings.get('strategy_mc_candidate_portfolios', 120))),
-        20,
-    )
-    if search_mode == 'current_sampled':
-        candidate_count = max(int(settings.get('strategy_mc_candidate_portfolios', 120)), 20)
     n_opp = max(int(settings.get('strategy_mc_num_opponents', 7)), 1)
-    noise_sigma = opp_params['noise_sigma']
-    aggr_sd = opp_params['aggr_sd']
     seed, seed_mode = _resolve_runtime_seed(settings, random_seed=None)
     sims = max(int(settings.get('strategy_mc_samples', 1500)), 200)
     integer_mode = bool(settings.get('strategy_integer_bid_mode', False))
@@ -2134,38 +2285,7 @@ def estimate_portfolio_win_probability(
         personal_cap = budget
     integer_cap = int(np.floor(min(personal_cap, budget)))
 
-    cost_df = strategy_df.copy()
-    if 'owner' in cost_df.columns:
-        cost_df = cost_df[cost_df['owner'].fillna('') == ''].copy()
-    cost_df['ticker'] = cost_df['ticker'].astype(str).str.upper()
-    cost_df['optimizer_cost'] = pd.to_numeric(cost_df.get(cost_col, np.nan), errors='coerce')
-    if integer_mode:
-        if cost_col in ('target_bid', 'target_bid_int') and 'target_bid_int' in cost_df.columns:
-            cost_df['optimizer_cost'] = pd.to_numeric(cost_df['target_bid_int'], errors='coerce')
-        else:
-            cost_df['optimizer_cost'] = np.ceil(cost_df['optimizer_cost'])
-        if integer_cap < min_legal:
-            return {
-                'win_probability': np.nan,
-                'opponent_count': 0,
-                'samples': sims,
-                'seed_mode': seed_mode,
-                'seed_used': int(seed),
-                'search_mode_used': search_mode,
-                'candidate_count_evaluated': 0,
-                'search_runtime_ms': float(max((time.perf_counter() - search_t0) * 1000.0, 0.0)),
-                'opponent_profile_used': opp_params.get('opponent_profile_used', 'balanced_field'),
-            }
-        cost_df['optimizer_cost'] = cost_df['optimizer_cost'].clip(lower=min_legal, upper=integer_cap)
-    cost_df['adjusted_expected'] = pd.to_numeric(cost_df.get('adjusted_expected', np.nan), errors='coerce')
-    cost_df = cost_df.dropna(subset=['optimizer_cost', 'adjusted_expected'])
-    cost_df = cost_df[(cost_df['optimizer_cost'] > 0) & (cost_df['adjusted_expected'] > 0)]
-    cost_df, _ = _apply_quality_filters(cost_df, settings)
-    per_film_cap = budget * max_pct
-    if integer_mode:
-        per_film_cap = min(per_film_cap, float(integer_cap))
-    cost_df = cost_df[cost_df['optimizer_cost'] <= per_film_cap].copy()
-    if cost_df.empty:
+    if integer_mode and integer_cap < min_legal:
         return {
             'win_probability': np.nan,
             'opponent_count': 0,
@@ -2176,23 +2296,12 @@ def estimate_portfolio_win_probability(
             'candidate_count_evaluated': 0,
             'search_runtime_ms': float(max((time.perf_counter() - search_t0) * 1000.0, 0.0)),
             'opponent_profile_used': opp_params.get('opponent_profile_used', 'balanced_field'),
+            'portfolio_budget_feasible': np.nan,
+            'selected_portfolio_spend': np.nan,
         }
 
-    valid_tickers = set(cost_df['ticker'].astype(str).str.upper().tolist())
-    cost_map = dict(zip(cost_df['ticker'].tolist(), pd.to_numeric(cost_df['optimizer_cost'], errors='coerce').fillna(0.0).tolist()))
     strategy_map = strategy_df.set_index('ticker')
     strategy_tickers = set(strategy_map.index.astype(str).str.upper().tolist())
-
-    def _is_budget_feasible(ticks: list[str]) -> bool:
-        if not ticks:
-            return False
-        uniq = sorted(set(str(t).upper() for t in ticks if str(t)))
-        if not uniq:
-            return False
-        if any(t not in valid_tickers for t in uniq):
-            return False
-        spend = float(sum(float(cost_map[t]) for t in uniq))
-        return spend <= float(budget) + 1e-9
 
     selected_ticks = (
         portfolio_df.get('ticker', pd.Series(dtype=object))
@@ -2222,111 +2331,6 @@ def estimate_portfolio_win_probability(
             break
     portfolio_budget_feasible = True if pd.isna(sel_spend) else (float(sel_spend) <= float(budget) + 1e-9)
 
-    rng = np.random.default_rng(seed)
-    candidate_sets: dict[tuple[str, ...], list[str]] = {}
-    deterministic = optimize_portfolio(strategy_df, budget, settings=settings, cost_col=cost_col)
-    if not deterministic.get('selected', pd.DataFrame()).empty:
-        base_ticks = sorted(deterministic['selected']['ticker'].astype(str).str.upper().tolist())
-        if _is_budget_feasible(base_ticks):
-            candidate_sets[tuple(base_ticks)] = base_ticks
-
-    attempts = 0
-    attempt_mult = 6 if search_mode == 'current_sampled' else 10
-    while len(candidate_sets) < candidate_count and attempts < candidate_count * attempt_mult:
-        attempts += 1
-        aggr = max(0.6, rng.normal(1.0, aggr_sd))
-        ticks = _random_greedy_tickers(
-            strategy_df=strategy_df,
-            budget=budget,
-            cost_col=cost_col,
-            max_pct=max_pct,
-            rng=rng,
-            score_noise=noise_sigma,
-            aggression=aggr,
-            integer_mode=integer_mode,
-            min_legal_bid=min_legal,
-            integer_cap=integer_cap,
-            bidup_strength=opp_params['bidup_strength'],
-            cash_conservation=opp_params['cash_conservation'],
-        )
-        if not ticks:
-            continue
-        key = tuple(sorted(set(ticks)))
-        if key and _is_budget_feasible(list(key)):
-            candidate_sets[key] = list(key)
-
-    if search_mode == 'local_search' and candidate_sets:
-        local_iters = max(int(settings.get('strategy_search_local_iters', 25)), 0)
-        value_map = dict(zip(
-            cost_df['ticker'].astype(str).str.upper().tolist(),
-            pd.to_numeric(cost_df['adjusted_expected'], errors='coerce').fillna(0.0).tolist(),
-        ))
-        for ticks in list(candidate_sets.values()):
-            refined = _local_search_refine(
-                ticks=ticks,
-                cost_map=cost_map,
-                value_map=value_map,
-                budget=float(budget),
-                iterations=local_iters,
-            )
-            key = tuple(sorted(set(refined)))
-            if key and _is_budget_feasible(list(key)):
-                candidate_sets[key] = list(key)
-
-    if search_mode == 'genetic' and candidate_sets:
-        value_map = dict(zip(
-            cost_df['ticker'].astype(str).str.upper().tolist(),
-            pd.to_numeric(cost_df['adjusted_expected'], errors='coerce').fillna(0.0).tolist(),
-        ))
-        ga_candidates = _genetic_candidate_sets(
-            base_candidates=list(candidate_sets.values()),
-            cost_map=cost_map,
-            value_map=value_map,
-            budget=float(budget),
-            rng=rng,
-            population_size=max(int(settings.get('strategy_search_population', 80)), 20),
-            generations=max(int(settings.get('strategy_search_generations', 30)), 1),
-            elite_frac=float(np.clip(settings.get('strategy_search_elite_frac', 0.20), 0.05, 0.90)),
-            mutation_rate=float(np.clip(settings.get('strategy_search_mutation_rate', 0.08), 0.0, 0.80)),
-            target_sets=max(candidate_count, 20),
-        )
-        for ticks in ga_candidates:
-            key = tuple(sorted(set(ticks)))
-            if key and _is_budget_feasible(list(key)):
-                candidate_sets[key] = list(key)
-
-    def _static_expected(ticks: list[str]) -> float:
-        total = 0.0
-        for t in ticks:
-            if t in strategy_map.index:
-                total += float(pd.to_numeric(pd.Series([strategy_map.at[t, 'adjusted_expected']]), errors='coerce').iloc[0] or 0.0)
-        return total
-
-    sorted_candidates = sorted(candidate_sets.values(), key=_static_expected, reverse=True)
-    opponent_sets = [c for c in sorted_candidates[:n_opp] if c]
-    opp_attempts = 0
-    while len(opponent_sets) < n_opp and opp_attempts < n_opp * 8:
-        opp_attempts += 1
-        aggr = max(0.6, rng.normal(1.0, aggr_sd))
-        ticks = _random_greedy_tickers(
-            strategy_df=strategy_df,
-            budget=budget,
-            cost_col=cost_col,
-            max_pct=max_pct,
-            rng=rng,
-            score_noise=noise_sigma,
-            aggression=aggr,
-            integer_mode=integer_mode,
-            min_legal_bid=min_legal,
-            integer_cap=integer_cap,
-            bidup_strength=opp_params['bidup_strength'],
-            cash_conservation=opp_params['cash_conservation'],
-        )
-        if ticks:
-            k = sorted(set(ticks))
-            if _is_budget_feasible(k):
-                opponent_sets.append(k)
-
     scenarios, _, _, _ = _build_return_scenarios(
         strategy_df=strategy_df,
         settings={**settings, 'strategy_mc_samples': sims},
@@ -2334,33 +2338,81 @@ def estimate_portfolio_win_probability(
         risk_model=risk_model,
         samples=sims,
         random_seed=seed,
+        progress_callback=lambda p, msg: progress_callback(p * 0.4, f"Building Scenarios: {msg}") if progress_callback else None,
     )
 
-    def portfolio_gross(tickers: list[str]) -> np.ndarray:
-        g = np.zeros(sims, dtype=float)
-        for t in tickers:
-            if t not in strategy_map.index:
-                continue
-            adj = float(pd.to_numeric(pd.Series([strategy_map.at[t, 'adjusted_expected']]), errors='coerce').iloc[0] or 0.0)
-            draws = scenarios.get(t, np.zeros(sims, dtype=float))
-            g += np.maximum(0.0, adj * (1.0 + draws))
-        return g
+    # Precompute per-movie gross arrays.
+    per_movie_gross_ep: dict[str, np.ndarray] = {}
+    for t in list(strategy_map.index):
+        t_upper = str(t).upper()
+        adj = float(pd.to_numeric(pd.Series([strategy_map.at[t, 'adjusted_expected']]), errors='coerce').iloc[0] or 0.0)
+        draws = scenarios.get(t, np.zeros(sims, dtype=float))
+        per_movie_gross_ep[t_upper] = np.maximum(0.0, adj * (1.0 + draws))
 
-    gross = portfolio_gross(selected_ticks)
-    opp_gross = [portfolio_gross(ticks) for ticks in opponent_sets]
-    opp_max = np.maximum.reduce(opp_gross) if opp_gross else np.zeros(sims, dtype=float)
-    wins = gross > (opp_max + 1e-9)
-    ties = np.abs(gross - opp_max) <= 1e-9
-    win_prob = float(np.mean(wins.astype(float) + 0.5 * ties.astype(float)))
+    def _gross_from_cache_ep(tickers: list[str]) -> np.ndarray:
+        arrays = [per_movie_gross_ep[str(t).upper()] for t in tickers if str(t).upper() in per_movie_gross_ep]
+        return np.sum(arrays, axis=0).astype(float) if arrays else np.zeros(sims, dtype=float)
+
+    selected_upper = frozenset(str(t).upper() for t in selected_ticks)
+    gross = _gross_from_cache_ep(list(selected_upper))
+
+    # Average results across multiple Draft Universes to ensure the estimate
+    # is robust against different opponent drafting outcomes.
+    n_univ = max(int(settings.get('strategy_mc_opponent_universes', 25)), 1)
+    univ_win_probs = []
+    univ_opp_counts = []
+
+    for u_idx in range(n_univ):
+        if progress_callback:
+            pct = 40.0 + (u_idx / n_univ) * 60.0
+            progress_callback(pct, f"Estimating: Universe {u_idx+1}/{n_univ}")
+        # Fresh RNG sequence for each draft universe
+        u_rng = np.random.default_rng([seed, 1000 + u_idx])
+        
+        opp_sets_u = _build_exclusive_opponent_sets(
+            strategy_df=strategy_df,
+            excluded_tickers=selected_upper,
+            n_opp=n_opp,
+            rng=u_rng,
+            cost_col=cost_col,
+            max_pct=max_pct,
+            budget=budget,
+            opp_params=opp_params,
+            integer_mode=integer_mode,
+            min_legal=1,
+            integer_cap=integer_cap,
+        )
+        
+        if not opp_sets_u:
+            univ_win_probs.append(1.0) # No opponents = 100% win
+            univ_opp_counts.append(0)
+            continue
+            
+        opp_gross_list = [_gross_from_cache_ep(o) for o in opp_sets_u]
+        opp_max = np.maximum.reduce(opp_gross_list)
+        
+        wins = gross > (opp_max + 1e-9)
+        ties = np.abs(gross - opp_max) <= 1e-9
+        win_prob_u = float(np.mean(wins.astype(float) + 0.5 * ties.astype(float)))
+        
+        univ_win_probs.append(win_prob_u)
+        univ_opp_counts.append(len(opp_sets_u))
+
+    win_prob = float(np.mean(univ_win_probs))
+    avg_opp_count = float(np.mean(univ_opp_counts))
+    if progress_callback:
+        progress_callback(100.0, "Estimation complete.")
 
     return {
         'win_probability': win_prob,
-        'opponent_count': int(len(opponent_sets)),
+        'opponent_count': int(round(avg_opp_count)),
+        'n_opp_requested': int(n_opp),
+        'opponent_universes': n_univ,
         'samples': int(sims),
         'seed_mode': seed_mode,
         'seed_used': int(seed),
         'search_mode_used': search_mode,
-        'candidate_count_evaluated': int(len(candidate_sets)),
+        'candidate_count_evaluated': 1,
         'search_runtime_ms': float(max((time.perf_counter() - search_t0) * 1000.0, 0.0)),
         'opponent_profile_used': opp_params.get('opponent_profile_used', 'balanced_field'),
         'portfolio_budget_feasible': bool(portfolio_budget_feasible) if pd.notna(portfolio_budget_feasible) else np.nan,

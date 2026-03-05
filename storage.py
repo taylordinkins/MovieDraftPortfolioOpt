@@ -61,6 +61,7 @@ _DEFAULT_SETTINGS = {
     'strategy_mc_opponent_noise': 0.30,
     'strategy_mc_aggression_sd': 0.10,
     'strategy_mc_concentration_threshold': 0.40,
+    'strategy_mc_opponent_universes': 10,
     'strategy_mc_aggression_grid': [0.9, 1.0, 1.1],
     # Phase 4 optional correlation simulation controls.
     'strategy_corr_simulation_mode': 'independent',  # independent | gaussian_copula | t_copula
