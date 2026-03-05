@@ -1,9 +1,17 @@
 {
   "version": 1,
-  "current_movie": "",
-  "current_bid": 0,
-  "updated_at": "2026-03-04T02:01:42.963338+00:00",
-  "assignments": {},
+  "current_movie": "HOPPR",
+  "current_bid": 18,
+  "updated_at": "2026-03-05T04:26:17.608204+00:00",
+  "assignments": {
+    "BRIDE": {
+      "winner": "Shrikant",
+      "final_price": 16.0,
+      "assigned_at": "2026-03-05T04:15:35.498231+00:00",
+      "budget_applied": true,
+      "source": "gui_assign"
+    }
+  },
   "history": [
     {
       "event_type": "assign",
@@ -94,6 +102,15 @@
       "timestamp": "2026-03-04T02:01:39.187651+00:00",
       "source": "gui_clear_all",
       "budget_restored": true
+    },
+    {
+      "event_type": "assign",
+      "ticker": "BRIDE",
+      "winner": "Shrikant",
+      "final_price": 16.0,
+      "timestamp": "2026-03-05T04:15:35.498231+00:00",
+      "source": "gui_assign",
+      "budget_applied": true
     }
   ]
 }
